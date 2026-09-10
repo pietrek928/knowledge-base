@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Knowledge Base</title>
+  <link rel="stylesheet" href="/static/app.css?v=3" />
+  <script src="/static/app.js?v=3" defer></script>
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js" async></script>
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js" async></script>
+</head>
+<body>
+  <header class="top">
+    <div class="top-row">
+      <div>
+        <h1>Knowledge Base</h1>
+        <p class="tag">Hybrid lexical + vector search</p>
+      </div>
+      <div id="health" class="health health-unknown" role="status" aria-live="polite" title="API health">
+        <span class="health-dot" aria-hidden="true"></span>
+        <span id="health_label">checking…</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="panel search-panel">
+      <label class="lbl" for="q">Query phrases <span class="hint">(one per line)</span></label>
+      <textarea id="q" rows="3" placeholder="search phrases…"></textarea>
+
+      <div class="row">
+        <label>Limit <input type="number" id="limit" value="10" min="1" max="100" /></label>
+        <label>Fusion
+          <select id="fusion">
+            <option value="cc">cc</option>
+            <option value="rrf">rrf</option>
+          </select>
+        </label>
+        <label><input type="checkbox" id="adaptive" checked /> Adaptive</label>
+        <label><input type="checkbox" id="id_fast" checked /> Identifier fast-path</label>
+      </div>
+
+      <details class="advanced">
+        <summary>Search parameters</summary>
+        <div class="grid">
+          <label>w exact <input type="number" step="0.05" id="w_exact" value="0.25" /></label>
+          <label>w fuzzy <input type="number" step="0.05" id="w_fuzzy" value="0.15" /></label>
+          <label>w bm25 <input type="number" step="0.05" id="w_bm25" value="0.3" /></label>
+          <label>w embed <input type="number" step="0.05" id="w_embed" value="0.3" /></label>
+          <label>candidate_k <input type="number" id="candidate_k" value="50" /></label>
+          <label>rescore_mult <input type="number" id="rescore_mult" value="8" /></label>
+          <label>min_confidence <input type="number" step="0.01" id="min_conf" placeholder="none" /></label>
+          <label>fuzziness <input id="fuzziness" value="auto" /></label>
+          <label>sibling_window <input type="number" id="sib_win" value="2" /></label>
+          <label>sibling_base <input type="number" step="0.01" id="sib_base" value="0.15" /></label>
+          <label>complement_bonus <input type="number" step="0.01" id="comp_bonus" value="0.2" /></label>
+          <label>cross_signal_bonus <input type="number" step="0.01" id="cross_bonus" value="0.1" /></label>
+          <label>sibling_inject_max <input type="number" id="sib_inject" value="2" /></label>
+          <label>path prefix <input id="path_prefix" placeholder="optional" /></label>
+          <label>date from <input id="date_from" placeholder="ISO" /></label>
+          <label>date to <input id="date_to" placeholder="ISO" /></label>
+          <label>date near <input id="date_near" placeholder="ISO" /></label>
+          <label>date weight <input type="number" step="0.05" id="date_w" value="0.35" /></label>
+          <label>half_life_days <input type="number" id="half_life" value="30" /></label>
+          <label>meta JSON <input id="meta_json" placeholder='{"k":"v"}' /></label>
+        </div>
+      </details>
+
+      <div class="row configs">
+        <input id="cfg_name" placeholder="config name" />
+        <button type="button" id="save_cfg">Save config</button>
+        <select id="cfg_list"><option value="">— saved configs —</option></select>
+        <button type="button" id="load_cfg">Load</button>
+        <button type="button" id="del_cfg">Delete</button>
+      </div>
+    </section>
+
+    <section class="panel results-panel">
+      <h2>Results <span id="status" class="hint"></span></h2>
+      <div id="results"></div>
+    </section>
+  </main>
+</body>
+</html>

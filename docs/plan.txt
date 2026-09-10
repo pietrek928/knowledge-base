@@ -1,0 +1,24 @@
+Hi, id like to create expandable knowledge base python server with fastapi endpoints and embedding support, also some nanobind c++ bindings for fast operations, like eg embedding matching, levenstein or text search
+for saved test documents id like u to store json files with records by paragraphs, with dates hashes and embeddings - content can be appended to documents so ull have to update those later, also embed with multiple models - will boost search
+hash paragrahs as converted to ascii lower letters, without spaces and special characters
+research for good methods of extracting paragraphs from text documents
+compute embeddings by connecting to ollama endpoint, by model and endpoint from json config file
+research good embedding prompts for search and query - is 1 embedding prompt for single model enough or will i benefit from multiple ones ?
+prepare service file running my server using uv and granian, add some pytest tests and include them in pyproject - good search, positioning and algorithms tests are most important
+
+endpoints i need:
+- post store - arguments: path and text, meant to be appended to this path, if paragraphs already are there(look by hashes) dont add them
+  while storing u may get part of existing text with added new blocks, position it accordingly by matching blocks - eg u can get text with prepended some blocks - put new blocks to begin
+- get search - arguments: text[] list of search text phrases, models[] to select embedding models, browse bool - to browse through database by text matching
+  return text blocks best matching embedding and/or text search depending on search arguments - merge it by reasonable weights, if search phrase starts with re: allow regex in it
+
+while searching if the number is inside query string, add \s* around it during text search - people tend to put spaces or not near numbers
+if u are searching in ascii mode, convert all special characters to ascii, and all letters to small, and remove special characters
+text search matching modes: ascii text no spaces, ascii text spaces, text with all special chars
+in phrase matching, if significant part of search phrase matches block text, take that into account, but with lower score accordingly
+during initial blocks search use fast suffix tree, during final blocks positioning use more reliable algos eg levenstein, also combine it with embeddings information
+
+in search if blocks match or close match multiple phrases, or near blocks match or close match search phrases, boost them in search ; simliar logic with embeddings - take into account that matching blocks are near
+
+make server serving a simple frontend, allowing mwe to type and query my knowledge base live
+display list of result blocks on search update with 300ms debounce

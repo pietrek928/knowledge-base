@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Gemini KB</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: #f7f8fa;
+        --fg: #1a1a1a;
+        --muted: #5f6368;
+        --accent: #1a73e8;
+        --border: #dadce0;
+        --warn: #b06000;
+      }
+      body {
+        font: 13px/1.4 system-ui, sans-serif;
+        margin: 0;
+        padding: 12px;
+        width: 320px;
+        background: var(--bg);
+        color: var(--fg);
+      }
+      h1 {
+        font-size: 14px;
+        margin: 0 0 10px;
+      }
+      label {
+        display: block;
+        margin: 8px 0 4px;
+        color: var(--muted);
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+      }
+      input[type="text"] {
+        width: 100%;
+        box-sizing: border-box;
+        padding: 6px 8px;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+      }
+      .row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin: 8px 0;
+      }
+      button {
+        border: 0;
+        border-radius: 6px;
+        padding: 8px 12px;
+        background: var(--accent);
+        color: #fff;
+        cursor: pointer;
+        font-weight: 600;
+      }
+      button.secondary {
+        background: #fff;
+        color: var(--fg);
+        border: 1px solid var(--border);
+      }
+      #status {
+        margin-top: 10px;
+        font-size: 12px;
+        color: var(--muted);
+        white-space: pre-wrap;
+      }
+      #list {
+        margin-top: 10px;
+        max-height: 180px;
+        overflow: auto;
+        border-top: 1px solid var(--border);
+        padding-top: 8px;
+      }
+      .chat {
+        padding: 6px 0;
+        border-bottom: 1px solid var(--border);
+      }
+      .chat .title {
+        font-weight: 600;
+      }
+      .badge {
+        display: inline-block;
+        font-size: 10px;
+        padding: 1px 6px;
+        border-radius: 999px;
+        background: #fef3cd;
+        color: var(--warn);
+        margin-left: 4px;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Gemini → Knowledge Base</h1>
+    <label for="kbUrl">KB URL</label>
+    <input id="kbUrl" type="text" placeholder="http://127.0.0.1:8080" />
+    <div class="row">
+      <input id="autoSave" type="checkbox" />
+      <span>Auto-save while browsing</span>
+    </div>
+    <div class="row">
+      <button id="saveSettings" class="secondary">Save settings</button>
+      <button id="pushNow">Push now</button>
+    </div>
+    <div id="status"></div>
+    <div id="list"></div>
+    <script src="popup.js"></script>
+  </body>
+</html>

@@ -1,0 +1,15 @@
+[Unit]
+Description=Knowledge Base (Granian)
+After=network.target
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=/home/%i/Documents/knowledge-base
+Environment=KB_CONFIG=/home/%i/Documents/knowledge-base/config.json
+ExecStart=/home/%i/.local/bin/uv run --directory /home/%i/Documents/knowledge-base kb serve --host 127.0.0.1 --port 8080
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

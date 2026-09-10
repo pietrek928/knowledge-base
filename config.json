@@ -1,0 +1,53 @@
+{
+  "data_dir": "~/.kb",
+  "ollama": {
+    "base_url": "http://127.0.0.1:11434",
+    "keep_alive": "30m",
+    "timeout_s": 120,
+    "batch_size": 16
+  },
+  "models": [
+    {
+      "name": "qwen3-embedding:8b",
+      "dim": 4096,
+      "num_ctx": 8192,
+      "matryoshka_dim": 256,
+      "document_prefix": "",
+      "query_prefix": "Instruct: Given a knowledge-base search query, retrieve relevant code or documentation passages.\nQuery: "
+    },
+    {
+      "name": "mxbai-embed-large",
+      "dim": 1024,
+      "num_ctx": 512,
+      "matryoshka_dim": null,
+      "document_prefix": "",
+      "query_prefix": "Represent this sentence for searching relevant passages: "
+    }
+  ],
+  "hash_width": 64,
+  "token_budget": 400,
+  "fusion": "cc",
+  "fusion_weights": {
+    "exact": 0.25,
+    "fuzzy": 0.15,
+    "bm25": 0.3,
+    "embed": 0.3
+  },
+  "rrf_k": 60,
+  "adaptive_fusion": true,
+  "rescore_multiplier": 8,
+  "candidate_k": 50,
+  "bm25": { "k1": 0.9, "b": 0.75 },
+  "auto_fuzziness": { "prefix_length": 1 },
+  "sibling_window": 2,
+  "sibling_base": 0.15,
+  "complement_bonus": 0.2,
+  "cross_signal_bonus": 0.1,
+  "sibling_inject_max": 2,
+  "identifier_fast_path": true,
+  "min_confidence": null,
+  "date": { "half_life_days": 30, "weight": 0.35 },
+  "query_cache_size": 256,
+  "embed_queue_size": 64,
+  "metadata_max_bytes": 16384
+}

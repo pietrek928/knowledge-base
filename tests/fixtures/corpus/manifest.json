@@ -1,0 +1,16 @@
+{
+  "docs": [
+    "code/auth.py",
+    "docs/auth.md",
+    "ops/errors.md",
+    "ops/sku.txt",
+    "notes/paraphrase.md"
+  ],
+  "queries": [
+    {"id": "identifier", "phrases": ["ERR_CONN_TIMEOUT"], "expect_path_substr": "errors"},
+    {"id": "sku", "phrases": ["SKU-99881"], "expect_path_substr": "sku"},
+    {"id": "code_symbol", "phrases": ["issue_token"], "expect_path_substr": "auth.py"},
+    {"id": "prose", "phrases": ["login flow issues a token"], "expect_path_substr": "auth"},
+    {"id": "paraphrase", "phrases": ["how does authentication work"], "expect_path_substr": "auth"}
+  ]
+}

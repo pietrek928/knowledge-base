@@ -1,0 +1,138 @@
+# Knowledge Base
+
+Local FastAPI knowledge base with hybrid lexical + vector search, dual Ollama embeddings, and a live search UI.
+
+## Features
+
+- JSON paragraph store under `~/.kb` (configurable `data_dir`)
+- Prose + tree-sitter code chunking; plain `text` for search, `source` for display
+- C++ `kb_native` (suffix array, trigrams, Aho–Corasick, Damerau–Levenshtein via rapidfuzz-cpp, BM25, Hamming / int8 / float16 rescoring)
+- Dual Ollama embedders: `qwen3-embedding:8b` + `mxbai-embed-large`
+- Three-tier vector retrieval (binary → int8 → float16)
+- Convex-combination fusion (RRF fallback) + sibling / complement boosts
+- Frontend with all search params and localStorage saved configs
+- Gemini chat ingest (Google Takeout + Chromium extension)
+
+## Setup
+
+Requires Python ≥3.11, CMake, a C++20 compiler, and [uv](https://github.com/astral-sh/uv).
+
+```bash
+uv sync
+uv pip install -e .
+# or: uv run pip install -e ".[dev]"
+```
+
+Optional: run Ollama locally and pull the embedding models. Tests always use fake embeddings (no network):
+
+```bash
+uv run pytest
+```
+
+## Run
+
+```bash
+uv run kb serve --host 127.0.0.1 --port 8080
+# without Ollama:
+uv run kb serve --fake-ollama
+```
+
+Open http://127.0.0.1:8080/
+
+## API
+
+- `POST /store` — `{ "path", "content", "metadata"? , "block_metadata"? }` (`metadata` is per-document)
+- `POST /ingest/gemini` — structured Gemini turns → format, fingerprint, skip-or-store
+- `GET /docs?prefix=gemini/` — list documents + document metadata (for extension reconcile)
+- `POST /search` — JSON body with `phrases`, `limit`, fusion/weights, date/meta filters, sibling boosts, …
+- `GET /search?q=…` — flat alias
+- `GET /health`
+
+OpenAPI UI: `/api/docs`
+
+## Gemini / Takeout
+
+Seed the KB from a Google Takeout of **My Activity → Gemini Apps** (HTML or JSON). Do not commit private Takeout zips.
+
+1. [takeout.google.com](https://takeout.google.com) → Deselect all → **My Activity** → only **Gemini Apps** (optional: Activity records as **JSON**).
+2. Set up the KB (`uv sync` / `uv pip install -e .`). The importer writes in-process (no server required). For the extension, run `uv run kb serve` as well.
+3. Import with **`uv run`**:
+
+```bash
+# Import from Takeout zip (layout: My Activity/Gemini Apps/MyActivity.html)
+uv run python scripts/import_gemini_takeout.py ~/Downloads/takeout-*.zip
+
+# Or from an extracted MyActivity.html / .json
+uv run python scripts/import_gemini_takeout.py /path/to/MyActivity.html
+
+# Preview without writing
+uv run python scripts/import_gemini_takeout.py /path/to/takeout.zip --dry-run
+
+# Without Ollama while embedding
+uv run python scripts/import_gemini_takeout.py /path/to/takeout.zip --fake-ollama
+```
+
+Re-runs are safe: unchanged conversations are skipped via `content_fingerprint`.
+
+### Extension (Chrome / Brave)
+
+Load unpacked from [`extension/gemini-kb/`](extension/gemini-kb/):
+
+1. Start the KB: `uv run kb serve --host 127.0.0.1 --port 8080`
+2. Chrome `chrome://extensions` or Brave `brave://extensions` → Developer mode → **Load unpacked** → select `extension/gemini-kb`
+3. Open the popup: set KB URL (`http://127.0.0.1:8080`), enable **Auto-save while browsing**
+4. Visit `https://gemini.google.com/app/<id>` — the extension paginates private `hNvQHb` RPC and `POST`s structured turns to `/ingest/gemini` (no public share links)
+5. Weekly alarm re-syncs chats that were never pushed, marked `pendingFullSync`, or last pushed &gt; 7 days ago
+
+## Ollama CPU usage
+
+By default Ollama often uses only physical/performance cores. To push more CPU:
+
+**Threads per request** (`num_thread`) — main lever for single-model throughput:
+
+```bash
+# Persistent: wrap the embedding model
+printf '%s\n' 'FROM qwen3-embedding:8b' 'PARAMETER num_thread 16' > /tmp/Modelfile
+ollama create qwen3-embedding:8b-t16 -f /tmp/Modelfile
+# then point config.json models[].name at qwen3-embedding:8b-t16
+```
+
+On recent Ollama builds you can also set a global override before starting the server:
+
+```bash
+export OLLAMA_NUM_THREADS=16   # physical cores is a good starting point
+```
+
+**Linux systemd** (system install):
+
+```bash
+sudo systemctl edit ollama.service
+```
+
+```ini
+[Service]
+Environment="OLLAMA_NUM_THREADS=16"
+# Optional: more concurrent embed requests (RAM scales with this × context)
+Environment="OLLAMA_NUM_PARALLEL=2"
+```
+
+```bash
+sudo systemctl daemon-reload && sudo systemctl restart ollama
+```
+
+`OLLAMA_NUM_PARALLEL` runs multiple requests at once (useful for this KB’s embed queue); it does **not** replace `num_thread` / `OLLAMA_NUM_THREADS`. Prefer physical-core count first, then benchmark.
+
+## systemd
+
+See `deploy/knowledge-base.service`. Enable with:
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp deploy/knowledge-base.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now knowledge-base.service
+```
+
+## Config
+
+Edit `config.json` (`data_dir`, models, fusion weights, BM25, sibling boosts, …).

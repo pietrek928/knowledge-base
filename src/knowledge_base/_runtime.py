@@ -1,0 +1,12 @@
+"""ASGI target for Granian workers (must build the app on import)."""
+
+from __future__ import annotations
+
+import os
+
+from knowledge_base.app import create_app
+from knowledge_base.config import load_config
+
+_cfg_path = os.environ.get("KB_CONFIG")
+_fake = os.environ.get("KB_FAKE_OLLAMA", "").lower() in ("1", "true", "yes")
+APP = create_app(load_config(_cfg_path) if _cfg_path else load_config(), fake_ollama=_fake)
