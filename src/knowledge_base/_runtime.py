@@ -1,7 +1,5 @@
 """ASGI target for Granian workers (must build the app on import)."""
 
-from __future__ import annotations
-
 import os
 
 from knowledge_base.app import create_app

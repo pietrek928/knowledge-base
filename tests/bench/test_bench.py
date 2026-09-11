@@ -1,7 +1,5 @@
 """Per-class bench floors — synthetic corpus, fake embeddings."""
 
-from __future__ import annotations
-
 import json
 from pathlib import Path
 
@@ -72,9 +70,13 @@ def _cfg(tmp_path: Path) -> dict:
         "min_confidence": None,
         "date": {"half_life_days": 30, "weight": 0.0},
         "query_cache_size": 32,
-        "embed_queue_size": 16,
         "metadata_max_bytes": 16384,
-        "ollama": {"base_url": "http://127.0.0.1:9", "keep_alive": "30m", "timeout_s": 1, "batch_size": 8},
+        "ollama": {
+            "base_url": "http://127.0.0.1:9",
+            "keep_alive": "30m",
+            "timeout_s": 1,
+            "batch_size": 8,
+        },
     }
 
 
@@ -110,7 +112,7 @@ async def test_identifier_beats_embed_only(bench_kb: KnowledgeBase):
 @pytest.mark.bench
 @pytest.mark.asyncio
 async def test_sibling_boost_changes_order(bench_kb: KnowledgeBase):
-    base = await bench_kb.search(
+    await bench_kb.search(
         {
             "phrases": ["login", "issue_token"],
             "limit": 10,
@@ -135,5 +137,7 @@ def test_write_fixture_manifest(tmp_path: Path):
     # ensure fixture dir exists for documentation
     root = Path(__file__).parent / "fixtures" / "corpus"
     root.mkdir(parents=True, exist_ok=True)
-    (root / "manifest.json").write_text(json.dumps({"queries": QUERIES, "docs": list(CORPUS)}, indent=2))
+    (root / "manifest.json").write_text(
+        json.dumps({"queries": QUERIES, "docs": list(CORPUS)}, indent=2)
+    )
     assert (root / "manifest.json").exists()

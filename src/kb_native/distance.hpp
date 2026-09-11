@@ -4,8 +4,8 @@
 
 namespace kb {
 
-double damerau_levenshtein(const std::string& a, const std::string& b);
-double normalized_similarity(const std::string& a, const std::string& b);
+double damerau_levenshtein(const std::string &a, const std::string &b);
+double normalized_similarity(const std::string &a, const std::string &b);
 
 struct FuzzyHit {
   int start;
@@ -13,8 +13,8 @@ struct FuzzyHit {
   double score;
 };
 
-std::vector<FuzzyHit> fuzzy_window_search(const std::string& text, const std::string& pattern,
+std::vector<FuzzyHit> fuzzy_window_search(const std::string &text, const std::string &pattern,
                                           double min_score, int max_hits,
-                                          const std::vector<int>& candidate_starts);
+                                          const std::vector<int> &candidate_starts);
 
-}  // namespace kb
+} // namespace kb

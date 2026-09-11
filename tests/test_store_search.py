@@ -45,9 +45,13 @@ def kb(tmp_path: Path):
         "min_confidence": None,
         "date": {"half_life_days": 30, "weight": 0.0},
         "query_cache_size": 32,
-        "embed_queue_size": 16,
         "metadata_max_bytes": 16384,
-        "ollama": {"base_url": "http://127.0.0.1:9", "keep_alive": "30m", "timeout_s": 1, "batch_size": 8},
+        "ollama": {
+            "base_url": "http://127.0.0.1:9",
+            "keep_alive": "30m",
+            "timeout_s": 1,
+            "batch_size": 8,
+        },
     }
     return KnowledgeBase(cfg, fake_ollama=True)
 

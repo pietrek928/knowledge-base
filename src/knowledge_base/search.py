@@ -1,20 +1,18 @@
-from __future__ import annotations
-
+import asyncio
 import math
 import re
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import numpy as np
 
 from knowledge_base.boosts import apply_sibling_boosts
-from knowledge_base.hashing import ascii_no_spaces
 from knowledge_base.index import LexicalIndex
 from knowledge_base.ollama import OllamaClient
 from knowledge_base.store import ContentStore
-from knowledge_base.tokenize import is_identifier_like, tokenize
-from knowledge_base.vectors import VectorStore, truncate_renorm
+from knowledge_base.tokenize import is_identifier_like
+from knowledge_base.vectors import VectorStore, as_readonly, truncate_renorm
 
 try:
     import kb_native
@@ -92,6 +90,109 @@ class SearchEngine:
         self.vector_stores = vector_stores
         self.ollama = ollama
 
+    def _run_lexical(
+        self,
+        phrases: list[str],
+        joined: str,
+        *,
+        id_like: bool,
+        fuzziness: Any,
+    ) -> tuple[dict[str, float], dict[str, float], dict[str, float], set[str]]:
+        exact_scores: dict[str, float] = defaultdict(float)
+        fuzzy_scores: dict[str, float] = defaultdict(float)
+        bm25_scores: dict[str, float] = defaultdict(float)
+        keyword_hits: set[str] = set()
+
+        if len(phrases) >= 2:
+            for _pid, h, _s, _e in self.index.aho_search(phrases):
+                exact_scores[h] += 1.0
+                keyword_hits.add(h)
+        texts = self.index.texts_items()
+        for ph in phrases:
+            if ph.startswith("re:"):
+                try:
+                    rx = re.compile(ph[3:], re.I)
+                except re.error:
+                    continue
+                for h, text in texts:
+                    if rx.search(text):
+                        exact_scores[h] += 1.0
+                        keyword_hits.add(h)
+                continue
+            for h, _start, _end, score in self.index.exact_search(ph):
+                exact_scores[h] = max(exact_scores[h], score)
+                keyword_hits.add(h)
+            for h, text in texts:
+                if ph.lower() in text.lower():
+                    exact_scores[h] = max(exact_scores[h], 1.0)
+                    keyword_hits.add(h)
+
+            auto = fuzziness
+            min_score = (
+                0.75 if auto == "auto" else float(auto) if isinstance(auto, (int, float)) else 0.7
+            )
+            if not id_like:
+                for h, _start, _end, score in self.index.fuzzy_search(ph, min_score=min_score):
+                    fuzzy_scores[h] = max(fuzzy_scores[h], score)
+                    keyword_hits.add(h)
+
+        for h, s in self.index.bm25_scores(joined).items():
+            bm25_scores[h] = s
+            if s > 0:
+                keyword_hits.add(h)
+        return dict(exact_scores), dict(fuzzy_scores), dict(bm25_scores), keyword_hits
+
+    def _retrieve_vs(
+        self,
+        vs: VectorStore,
+        q: np.ndarray,
+        *,
+        candidate_k: int,
+        rescore_mult: int,
+        limit: int,
+    ) -> dict[str, float]:
+        embed_scores: dict[str, float] = {}
+        with vs.read_lock():
+            views = vs.search_views()
+            if views is None:
+                return embed_scores
+            emb, q8, scales, bits, row_to_hash = views
+            q = as_readonly(np.asarray(q, dtype=np.float32))
+            tier_q = as_readonly(truncate_renorm(q, vs.mrl if vs.mrl else None))
+            if kb_native is not None:
+                if bits.size == 0:
+                    return embed_scores
+                q_bits = as_readonly(np.asarray(kb_native.pack_binary(tier_q), dtype=np.uint64))
+                k = min(candidate_k * rescore_mult, bits.shape[0])
+                top = kb_native.hamming_topk(bits, q_bits, k)
+                row_ids = [r for r, _d in top]
+                tq = np.zeros(vs.tier_dim, dtype=np.float32)
+                tq[: min(vs.tier_dim, tier_q.shape[0])] = tier_q[: vs.tier_dim]
+                tq = as_readonly(tq)
+                int8_scores = kb_native.rescore_int8(tq, q8, scales, row_ids)
+                order = np.argsort(-np.asarray(int8_scores))[: max(limit * 2, 10)]
+                survivors = [row_ids[i] for i in order]
+                emb_u16 = as_readonly(
+                    emb.view(np.uint16)
+                    if emb.dtype == np.float16
+                    else emb.astype(np.float16).view(np.uint16)
+                )
+                f16_scores = kb_native.rescore_f16(q, emb_u16, survivors)
+                for rid, sc in zip(survivors, f16_scores):
+                    h = row_to_hash[rid]
+                    embed_scores[h] = max(embed_scores.get(h, -1.0), float(sc))
+            else:
+                emb_f = np.asarray(emb, dtype=np.float32)
+                if emb_f.size == 0:
+                    return embed_scores
+                qn = q / (np.linalg.norm(q) or 1.0)
+                sims = emb_f @ qn
+                top_idx = np.argsort(-sims)[:candidate_k]
+                for rid in top_idx:
+                    h = row_to_hash[int(rid)]
+                    embed_scores[h] = max(embed_scores.get(h, -1.0), float(sims[rid]))
+        return embed_scores
+
     async def search(self, body: dict[str, Any]) -> dict[str, Any]:
         phrases = body.get("phrases") or body.get("q") or []
         if isinstance(phrases, str):
@@ -110,106 +211,69 @@ class SearchEngine:
         meta_filter = body.get("meta") or {}
         path_prefix = body.get("path")
 
-        exact_scores: dict[str, float] = defaultdict(float)
-        fuzzy_scores: dict[str, float] = defaultdict(float)
-        bm25_scores: dict[str, float] = defaultdict(float)
-        embed_scores: dict[str, float] = defaultdict(float)
-        keyword_hits: set[str] = set()
-        embed_hits: set[str] = set()
-
-        # lexical
         joined = " ".join(phrases)
         id_like = identifier_fp and any(is_identifier_like(p) for p in phrases)
 
-        if len(phrases) >= 2:
-            for pid, h, _s, _e in self.index.aho_search(phrases):
-                exact_scores[h] += 1.0
-                keyword_hits.add(h)
-        for ph in phrases:
-            if ph.startswith("re:"):
+        async def _lexical() -> tuple[
+            dict[str, float], dict[str, float], dict[str, float], set[str]
+        ]:
+            return await asyncio.to_thread(
+                self._run_lexical,
+                phrases,
+                joined,
+                id_like=id_like,
+                fuzziness=body.get("fuzziness", "auto"),
+            )
+
+        async def _query_embeds() -> list[np.ndarray | None]:
+            if not self.vector_stores:
+                return []
+
+            async def _one(vs: VectorStore) -> np.ndarray | None:
                 try:
-                    rx = re.compile(ph[3:], re.I)
-                except re.error:
-                    continue
-                for h, text in self.index.texts.items():
-                    if rx.search(text):
-                        exact_scores[h] += 1.0
-                        keyword_hits.add(h)
-                continue
-            for h, start, end, score in self.index.exact_search(ph):
-                exact_scores[h] = max(exact_scores[h], score)
-                keyword_hits.add(h)
-            # also raw substring
-            for h, text in self.index.texts.items():
-                if ph.lower() in text.lower():
-                    exact_scores[h] = max(exact_scores[h], 1.0)
-                    keyword_hits.add(h)
-
-            auto = body.get("fuzziness", "auto")
-            min_score = 0.75 if auto == "auto" else float(auto) if isinstance(auto, (int, float)) else 0.7
-            if not id_like:
-                for h, start, end, score in self.index.fuzzy_search(ph, min_score=min_score):
-                    fuzzy_scores[h] = max(fuzzy_scores[h], score)
-                    keyword_hits.add(h)
-
-        for h, s in self.index.bm25_scores(joined).items():
-            bm25_scores[h] = s
-            if s > 0:
-                keyword_hits.add(h)
-
-        # embeddings (skip when identifier fast-path and strong lexical)
-        run_embed = not (id_like and exact_scores)
-        if run_embed and self.vector_stores:
-            for vs in self.vector_stores:
-                model = vs.model
-                try:
-                    qvecs = await self.ollama.embed(model, [joined], is_query=True)
+                    qvecs = await self.ollama.embed(vs.model, [joined], is_query=True)
                 except Exception:
+                    return None
+                return qvecs[0] if qvecs else None
+
+            return list(await asyncio.gather(*[_one(vs) for vs in self.vector_stores]))
+
+        # Identifier fast-path: run lexical first; skip embeds if strong exact hits.
+        if id_like:
+            exact_scores, fuzzy_scores, bm25_scores, keyword_hits = await _lexical()
+            qvecs: list[np.ndarray | None] = []
+            run_embed = not bool(exact_scores)
+            if run_embed:
+                qvecs = await _query_embeds()
+        else:
+            (exact_scores, fuzzy_scores, bm25_scores, keyword_hits), qvecs = await asyncio.gather(
+                _lexical(), _query_embeds()
+            )
+
+        embed_scores: dict[str, float] = defaultdict(float)
+        embed_hits: set[str] = set()
+        if qvecs and self.vector_stores:
+            retrieve_coros = []
+            for vs, q in zip(self.vector_stores, qvecs):
+                if q is None:
                     continue
-                if not qvecs or vs.bits is None or vs.emb is None or vs.q8 is None or vs.scales is None:
-                    continue
-                q = qvecs[0]
-                tier_q = truncate_renorm(q, vs.mrl if vs.mrl else None)
-                if kb_native is not None:
-                    q_bits = np.asarray(kb_native.pack_binary(tier_q.astype(np.float32)), dtype=np.uint64)
-                    # pad bits matrix width
-                    bits = np.asarray(vs.bits[: len(vs.row_to_hash)])
-                    if bits.size == 0:
-                        continue
-                    k = min(candidate_k * rescore_mult, bits.shape[0])
-                    top = kb_native.hamming_topk(bits, q_bits, k)
-                    row_ids = [r for r, _d in top]
-                    # int8 rescore
-                    scales = np.asarray(vs.scales[: len(vs.row_to_hash)], dtype=np.float32)
-                    q8 = np.asarray(vs.q8[: len(vs.row_to_hash)])
-                    # pad query to tier_dim
-                    tq = np.zeros(vs.tier_dim, dtype=np.float32)
-                    tq[: min(vs.tier_dim, tier_q.shape[0])] = tier_q[: vs.tier_dim]
-                    int8_scores = kb_native.rescore_int8(tq, q8, scales, row_ids)
-                    order = np.argsort(-np.asarray(int8_scores))[: max(limit * 2, 10)]
-                    survivors = [row_ids[i] for i in order]
-                    emb = np.asarray(vs.emb[: len(vs.row_to_hash)])
-                    # convert emb to uint16 view for rescore_f16 — use numpy float16
-                    emb_u16 = emb.view(np.uint16) if emb.dtype == np.float16 else emb.astype(np.float16).view(np.uint16)
-                    f16_scores = kb_native.rescore_f16(q.astype(np.float32), emb_u16, survivors)
-                    for rid, sc in zip(survivors, f16_scores):
-                        h = vs.row_to_hash[rid]
-                        embed_scores[h] = max(embed_scores[h], float(sc))
-                        embed_hits.add(h)
-                else:
-                    # pure numpy fallback
-                    emb = np.asarray(vs.emb[: len(vs.row_to_hash)], dtype=np.float32)
-                    if emb.size == 0:
-                        continue
-                    qn = q / (np.linalg.norm(q) or 1.0)
-                    sims = emb @ qn
-                    top_idx = np.argsort(-sims)[:candidate_k]
-                    for rid in top_idx:
-                        h = vs.row_to_hash[int(rid)]
-                        embed_scores[h] = max(embed_scores[h], float(sims[rid]))
+                retrieve_coros.append(
+                    asyncio.to_thread(
+                        self._retrieve_vs,
+                        vs,
+                        q,
+                        candidate_k=candidate_k,
+                        rescore_mult=rescore_mult,
+                        limit=limit,
+                    )
+                )
+            if retrieve_coros:
+                parts = await asyncio.gather(*retrieve_coros)
+                for part in parts:
+                    for h, sc in part.items():
+                        embed_scores[h] = max(embed_scores[h], sc)
                         embed_hits.add(h)
 
-        # adaptive weights
         w = {
             "exact": float(weights.get("exact", 0.25)),
             "fuzzy": float(weights.get("fuzzy", 0.15)),
@@ -219,7 +283,6 @@ class SearchEngine:
         if adaptive:
             mean_idf = self.index.mean_idf(joined)
             if id_like or mean_idf > 2.5:
-                # shift toward lexical
                 w = {"exact": 0.3, "fuzzy": 0.1, "bm25": 0.35, "embed": 0.25}
             elif mean_idf < 1.0:
                 w = {"exact": 0.15, "fuzzy": 0.1, "bm25": 0.25, "embed": 0.5}
@@ -258,13 +321,12 @@ class SearchEngine:
                     + w["embed"] * s_embed.get(h, 0.0)
                 )
 
-        # date / meta / path filters + date boost
         half_life = float(date_cfg.get("half_life_days", 30) or 30)
         date_w = float(date_cfg.get("weight", 0.0) or 0.0)
         d_from = _parse_dt(date_cfg.get("from"))
         d_to = _parse_dt(date_cfg.get("to"))
         d_near = _parse_dt(date_cfg.get("near"))
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
 
         results: list[dict[str, Any]] = []
         for h, score in fused.items():
@@ -319,11 +381,15 @@ class SearchEngine:
             embed_hits=embed_hits,
             sibling_window=int(body.get("sibling_window", self.cfg.get("sibling_window", 2))),
             sibling_base=float(body.get("sibling_base", self.cfg.get("sibling_base", 0.15))),
-            complement_bonus=float(body.get("complement_bonus", self.cfg.get("complement_bonus", 0.2))),
+            complement_bonus=float(
+                body.get("complement_bonus", self.cfg.get("complement_bonus", 0.2))
+            ),
             cross_signal_bonus=float(
                 body.get("cross_signal_bonus", self.cfg.get("cross_signal_bonus", 0.1))
             ),
-            sibling_inject_max=int(body.get("sibling_inject_max", self.cfg.get("sibling_inject_max", 2))),
+            sibling_inject_max=int(
+                body.get("sibling_inject_max", self.cfg.get("sibling_inject_max", 2))
+            ),
         )
 
         if min_conf is not None:

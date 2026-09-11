@@ -2,7 +2,6 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from knowledge_base.app import create_app
-from knowledge_base.service import KnowledgeBase
 
 
 @pytest.fixture
@@ -36,9 +35,13 @@ def app(tmp_path):
         "min_confidence": None,
         "date": {"half_life_days": 30, "weight": 0.0},
         "query_cache_size": 8,
-        "embed_queue_size": 8,
         "metadata_max_bytes": 4096,
-        "ollama": {"base_url": "http://127.0.0.1:9", "keep_alive": "1m", "timeout_s": 1, "batch_size": 4},
+        "ollama": {
+            "base_url": "http://127.0.0.1:9",
+            "keep_alive": "1m",
+            "timeout_s": 1,
+            "batch_size": 4,
+        },
     }
     return create_app(cfg, fake_ollama=True)
 

@@ -1,13 +1,21 @@
-from __future__ import annotations
-
-import struct
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
 from knowledge_base.config import model_slug
+
+
+def as_readonly(a: np.ndarray) -> np.ndarray:
+    """Return a view marked non-writeable (safe to borrow under GIL release)."""
+    v = np.asarray(a)
+    if v.flags.writeable:
+        v = v.view()
+        v.setflags(write=False)
+    return v
 
 
 def quantize_int8(vec: np.ndarray) -> tuple[np.ndarray, float]:
@@ -44,7 +52,11 @@ def truncate_renorm(vec: np.ndarray, dim: int | None) -> np.ndarray:
 
 
 class VectorStore:
-    """Per-model memmapped emb (f16), q8 (int8), bits (uint64), plus hash index."""
+    """Per-model memmapped emb (f16), q8 (int8), bits (uint64), plus hash index.
+
+    Internal mmaps stay writeable for upsert. Search consumers use ``search_views()``
+    under ``read_lock()`` so concurrent upsert cannot mutate borrowed buffers.
+    """
 
     def __init__(self, data_dir: str | Path, model: dict[str, Any]) -> None:
         self.data_dir = Path(data_dir)
@@ -71,6 +83,12 @@ class VectorStore:
         self.bits: np.ndarray | None = None
         self._load()
 
+    @contextmanager
+    def read_lock(self) -> Iterator[None]:
+        """Shared with upsert: hold while borrowing search_views into native code."""
+        with self._lock:
+            yield
+
     def _load(self) -> None:
         if self.meta_path.exists():
             meta = np.load(self.meta_path, allow_pickle=True)
@@ -91,8 +109,10 @@ class VectorStore:
             self._rewrite(n)
 
     def _rewrite(self, capacity: int) -> None:
-        old_n = len(self.row_to_hash)
-        capacity = max(capacity, old_n, 8)
+        # Copy only rows that exist on disk — never use len(row_to_hash) as the
+        # source slice if meta was appended before growth (legacy bug).
+        stored = 0 if self.emb is None else int(self.emb.shape[0])
+        capacity = max(capacity, stored, len(self.row_to_hash), 8)
         emb = np.zeros((capacity, self.dim), dtype=np.float16)
         q8 = np.zeros((capacity, self.tier_dim), dtype=np.int8)
         scales = np.ones((capacity,), dtype=np.float32)
@@ -102,12 +122,12 @@ class VectorStore:
             and self.q8 is not None
             and self.scales is not None
             and self.bits is not None
-            and old_n
+            and stored
         ):
-            emb[:old_n] = np.asarray(self.emb[:old_n])
-            q8[:old_n] = np.asarray(self.q8[:old_n])
-            scales[:old_n] = np.asarray(self.scales[:old_n])
-            bits[:old_n] = np.asarray(self.bits[:old_n])
+            emb[:stored] = np.asarray(self.emb[:stored])
+            q8[:stored] = np.asarray(self.q8[:stored])
+            scales[:stored] = np.asarray(self.scales[:stored])
+            bits[:stored] = np.asarray(self.bits[:stored])
         np.save(self.emb_path, emb)
         np.save(self.q8_path, q8)
         np.save(self.scale_path, scales)
@@ -120,6 +140,27 @@ class VectorStore:
     def _save_meta(self) -> None:
         np.savez(self.meta_path, hashes=np.array(self.row_to_hash, dtype=object))
 
+    def search_views(
+        self,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[str]] | None:
+        """Readonly active-row views + row_to_hash snapshot. Caller must hold read_lock."""
+        n = len(self.row_to_hash)
+        if (
+            n == 0
+            or self.emb is None
+            or self.q8 is None
+            or self.scales is None
+            or self.bits is None
+        ):
+            return None
+        return (
+            as_readonly(self.emb[:n]),
+            as_readonly(self.q8[:n]),
+            as_readonly(self.scales[:n]),
+            as_readonly(self.bits[:n]),
+            list(self.row_to_hash),
+        )
+
     def upsert(self, h: str, vector: np.ndarray) -> int:
         with self._lock:
             v = np.asarray(vector, dtype=np.float32).reshape(-1)
@@ -131,15 +172,15 @@ class VectorStore:
                 row = self.hash_to_row[h]
             else:
                 row = len(self.row_to_hash)
+                # Grow mmaps before appending meta so _rewrite copies shape matches.
+                self._ensure_capacity(row + 1)
                 self.row_to_hash.append(h)
                 self.hash_to_row[h] = row
-                self._ensure_capacity(row + 1)
             assert self.emb is not None and self.q8 is not None
             assert self.scales is not None and self.bits is not None
             self.emb[row] = v.astype(np.float16)
             tier = truncate_renorm(v, self.mrl if self.mrl else None)
             if tier.shape[0] != self.tier_dim:
-                # pad/truncate
                 t = np.zeros(self.tier_dim, dtype=np.float32)
                 t[: min(self.tier_dim, tier.shape[0])] = tier[: self.tier_dim]
                 tier = t
@@ -151,7 +192,9 @@ class VectorStore:
             return row
 
     def has(self, h: str) -> bool:
-        return h in self.hash_to_row
+        with self._lock:
+            return h in self.hash_to_row
 
     def missing(self, hashes: list[str]) -> list[str]:
-        return [h for h in hashes if h not in self.hash_to_row]
+        with self._lock:
+            return [h for h in hashes if h not in self.hash_to_row]

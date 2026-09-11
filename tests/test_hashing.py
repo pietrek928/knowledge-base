@@ -1,4 +1,4 @@
-from knowledge_base.hashing import ascii_no_spaces, ascii_with_spaces, disambiguate_hash, hash_text
+from knowledge_base.hashing import ascii_with_spaces, disambiguate_hash, hash_text
 
 
 def test_anyascii_fold():

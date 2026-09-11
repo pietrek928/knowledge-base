@@ -1,7 +1,5 @@
 """Parse Google Takeout Gemini Activity (HTML/JSON) into structured turns."""
 
-from __future__ import annotations
-
 import json
 import re
 from datetime import datetime
@@ -11,9 +9,7 @@ from zoneinfo import ZoneInfo
 
 from knowledge_base.plainify import to_plain
 
-_APP_ID_RE = re.compile(
-    r"https://gemini\.google\.com/app/([a-f0-9]+)", re.IGNORECASE
-)
+_APP_ID_RE = re.compile(r"https://gemini\.google\.com/app/([a-f0-9]+)", re.IGNORECASE)
 _PROMPTED_RE = re.compile(r"^Prompted[\u00a0\s]+", re.IGNORECASE)
 _DATE_LINE_RE = re.compile(
     r"^([A-Za-z]{3}\s+\d{1,2},\s+\d{4},\s+\d{1,2}:\d{2}:\d{2}\s*[AP]M)\s*([A-Z]{2,5})\s*$"
@@ -125,9 +121,7 @@ def parse_myactivity_html(html: str) -> dict[str, dict[str, Any]]:
             {"conversation_id": cid, "title": user[:80], "turns": []},
         )
         turns: list[dict[str, Any]] = conv["turns"]
-        turns.append(
-            {"role": "user", "text": user, "ts_sec": ts_sec, "ts_nanos": ts_nanos}
-        )
+        turns.append({"role": "user", "text": user, "ts_sec": ts_sec, "ts_nanos": ts_nanos})
         if answer:
             turns.append(
                 {
@@ -182,9 +176,7 @@ def parse_myactivity_json(data: Any) -> dict[str, dict[str, Any]]:
             cid,
             {"conversation_id": cid, "title": user[:80], "turns": []},
         )
-        conv["turns"].append(
-            {"role": "user", "text": user, "ts_sec": ts_sec, "ts_nanos": 0}
-        )
+        conv["turns"].append({"role": "user", "text": user, "ts_sec": ts_sec, "ts_nanos": 0})
         if answer:
             conv["turns"].append(
                 {
@@ -209,19 +201,11 @@ def load_takeout(path: Path) -> dict[str, dict[str, Any]]:
         with zipfile.ZipFile(path) as zf:
             names = zf.namelist()
             html_name = next(
-                (
-                    n
-                    for n in names
-                    if n.endswith("MyActivity.html") and "Gemini" in n
-                ),
+                (n for n in names if n.endswith("MyActivity.html") and "Gemini" in n),
                 None,
             )
             json_name = next(
-                (
-                    n
-                    for n in names
-                    if n.endswith("MyActivity.json") and "Gemini" in n
-                ),
+                (n for n in names if n.endswith("MyActivity.json") and "Gemini" in n),
                 None,
             )
             if json_name:

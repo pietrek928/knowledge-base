@@ -1,9 +1,11 @@
-from __future__ import annotations
-
 import asyncio
+import contextlib
+import logging
 import threading
 from pathlib import Path
 from typing import Any
+
+import httpx
 
 from knowledge_base.config import load_config
 from knowledge_base.index import LexicalIndex
@@ -11,6 +13,8 @@ from knowledge_base.ollama import OllamaClient
 from knowledge_base.search import SearchEngine
 from knowledge_base.store import ContentStore
 from knowledge_base.vectors import VectorStore
+
+log = logging.getLogger(__name__)
 
 
 class KnowledgeBase:
@@ -36,78 +40,57 @@ class KnowledgeBase:
         )
         self._embed_q: asyncio.Queue[str] | None = None
         self._embed_task: asyncio.Task | None = None
-        self._backfill_task: asyncio.Task | None = None
+        self._embed_queued: set[str] = set()
+        self._embed_queued_lock = threading.Lock()
         self._lock = threading.RLock()
+        self._batch_size = int((self.cfg.get("ollama") or {}).get("batch_size", 4))
 
     async def start(self, *, backfill: bool = True) -> None:
-        """Start embed worker. Missing embeds are queued in the background (non-blocking)."""
-        self._embed_q = asyncio.Queue(maxsize=int(self.cfg.get("embed_queue_size", 64)))
+        """Start the single embed worker. Optionally queue missing embeds (non-blocking)."""
+        self._embed_q = asyncio.Queue()  # unbounded — store must never block on put
         self._embed_task = asyncio.create_task(self._embed_worker())
-        self._backfill_task = None
         await self.ollama.prewarm()
         if backfill:
-            # Do not await: previously this blocked takeout import for minutes with no tqdm.
-            self._backfill_task = asyncio.create_task(self.enqueue_missing_embeds())
+            self.submit_embed(self.missing_embed_hashes())
 
-    async def stop(self) -> None:
-        if self._backfill_task is not None:
-            try:
-                await self._backfill_task
-            except asyncio.CancelledError:
-                pass
-            self._backfill_task = None
+    async def drain_embeds(self) -> None:
         if self._embed_q is not None:
-            # Finish queued embeds before tearing down the worker / HTTP client.
             await self._embed_q.join()
+
+    async def stop(self, *, drain: bool = True) -> None:
+        if drain:
+            await self.drain_embeds()
         if self._embed_task:
             self._embed_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await self._embed_task
-            except asyncio.CancelledError:
-                pass
+            self._embed_task = None
+        self._embed_q = None
+        with self._embed_queued_lock:
+            self._embed_queued.clear()
         await self.ollama.close()
 
-    async def _embed_worker(self) -> None:
-        assert self._embed_q is not None
-        while True:
-            h = await self._embed_q.get()
-            try:
-                await self._embed_hash(h)
-            except Exception:
-                pass
-            finally:
-                self._embed_q.task_done()
+    def pending_embed_count(self) -> int:
+        with self._embed_queued_lock:
+            return len(self._embed_queued)
 
-    async def _embed_hash(self, h: str) -> None:
-        bref = self.store.get(h)
-        if not bref:
-            return
-        text = (bref.text or "").strip()
-        if not text:
-            return
-        for vs in self.vector_stores:
-            if vs.has(h):
-                continue
-            vecs = await self.ollama.embed(vs.model, [text], is_query=False)
-            if vecs:
-                vs.upsert(h, vecs[0])
-
-    async def enqueue_embed(self, hashes: list[str]) -> None:
-        """Queue hashes for background embed. Never fail the store path on embed errors."""
-        if self._embed_q is None:
+    def submit_embed(self, hashes: list[str]) -> int:
+        """Non-blocking enqueue. Returns number newly queued. Safe during store."""
+        if self._embed_q is None or not hashes:
+            return 0
+        n = 0
+        with self._embed_queued_lock:
             for h in hashes:
-                try:
-                    await self._embed_hash(h)
-                except Exception:
-                    pass
-            return
-        for h in hashes:
-            # Backpressure instead of put_nowait + sync embed (sync path raised and aborted imports)
-            await self._embed_q.put(h)
+                if not h or h in self._embed_queued:
+                    continue
+                self._embed_queued.add(h)
+                self._embed_q.put_nowait(h)
+                n += 1
+        return n
 
     def missing_embed_hashes(self) -> list[str]:
-        """Block hashes missing from at least one vector store (deduped, stable order)."""
-        hashes = [b.hash for b in self.store.all_blocks()]
+        """Non-empty block hashes missing from at least one vector store."""
+        hashes = [b.hash for b in self.store.all_blocks() if (b.text or "").strip()]
         seen: set[str] = set()
         out: list[str] = []
         for vs in self.vector_stores:
@@ -117,19 +100,78 @@ class KnowledgeBase:
                     out.append(h)
         return out
 
-    async def enqueue_missing_embeds(self) -> int:
-        """Queue missing embeddings for the background worker. Returns count queued."""
+    async def backfill_missing(self) -> int:
+        """Queue missing embeddings and wait until drained (tests / explicit catch-up)."""
         missing = self.missing_embed_hashes()
-        if missing:
-            await self.enqueue_embed(missing)
+        self.submit_embed(missing)
+        await self.drain_embeds()
         return len(missing)
 
-    async def backfill_missing(self) -> int:
-        """Queue missing embeddings and wait until the embed queue is drained."""
-        n = await self.enqueue_missing_embeds()
-        if self._embed_q is not None:
-            await self._embed_q.join()
-        return n
+    async def _embed_worker(self) -> None:
+        assert self._embed_q is not None
+        while True:
+            first = await self._embed_q.get()
+            batch = [first]
+            while len(batch) < self._batch_size:
+                try:
+                    batch.append(self._embed_q.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+            try:
+                await self._embed_batch(batch)
+            except Exception:
+                log.exception("embed batch failed (%d hashes)", len(batch))
+            finally:
+                with self._embed_queued_lock:
+                    for h in batch:
+                        self._embed_queued.discard(h)
+                for _ in batch:
+                    self._embed_q.task_done()
+
+    async def _embed_batch(self, hashes: list[str]) -> None:
+        items: list[tuple[str, str]] = []
+        for h in hashes:
+            bref = self.store.get(h)
+            if not bref:
+                continue
+            text = (bref.text or "").strip()
+            if text:
+                items.append((h, text))
+        if not items:
+            return
+        hs = [h for h, _ in items]
+        texts = [t for _, t in items]
+
+        # One model at a time — parallel dual-model embeds share Ollama's queue while
+        # each httpx read timer runs, which causes ReadTimeouts on CPU.
+        for vs in self.vector_stores:
+            need_h: list[str] = []
+            need_t: list[str] = []
+            for h, t in zip(hs, texts):
+                if not vs.has(h):
+                    need_h.append(h)
+                    need_t.append(t)
+            if not need_t:
+                continue
+            try:
+                vecs = await self.ollama.embed(vs.model, need_t, is_query=False)
+            except httpx.TimeoutException:
+                continue  # already warned in OllamaClient
+            except Exception:
+                log.exception("embed failed model=%s n=%d", vs.model.get("name"), len(need_t))
+                continue
+            if len(vecs) != len(need_t):
+                raise RuntimeError(
+                    f"embed length mismatch model={vs.model.get('name')}: "
+                    f"{len(vecs)} != {len(need_t)}"
+                )
+            for h, v in zip(need_h, vecs):
+                vs.upsert(h, v)
+
+    async def rebuild_index(self) -> None:
+        """Snapshot lexical index off-thread and publish under lock."""
+        blocks = [(b.hash, b.text) for b in self.store.all_blocks()]
+        await self.index.rebuild_from_blocks_async(blocks)
 
     async def store_document(
         self,
@@ -137,6 +179,9 @@ class KnowledgeBase:
         content: str,
         metadata: dict[str, Any] | None = None,
         block_metadata: dict[str, Any] | None = None,
+        *,
+        embed: bool = True,
+        rebuild_index: bool = True,
     ) -> dict[str, Any]:
         with self._lock:
             blocks = self.store.store(
@@ -147,8 +192,10 @@ class KnowledgeBase:
                 block_metadata=block_metadata,
                 metadata_max_bytes=int(self.cfg.get("metadata_max_bytes", 16384)),
             )
-            self.index.rebuild()
-        await self.enqueue_embed([b.hash for b in blocks])
+        if embed:
+            self.submit_embed([b.hash for b in blocks])
+        if rebuild_index:
+            await self.rebuild_index()
         return {
             "path": path,
             "blocks": [{"hash": b.hash, "index": b.index, "text": b.text} for b in blocks],
@@ -164,6 +211,8 @@ class KnowledgeBase:
         title: str | None,
         turns: list[dict[str, Any]],
         ingest: str = "extension",
+        embed: bool = True,
+        rebuild_index: bool = True,
     ) -> dict[str, Any]:
         from knowledge_base.gemini_format import (
             build_doc_metadata,
@@ -182,6 +231,9 @@ class KnowledgeBase:
         existing = self.store.get_doc_metadata(path)
         message_count = len(turns)
         if existing.get("content_fingerprint") == fp:
+            if embed:
+                # Heal embed gaps without re-storing unchanged content.
+                self.submit_embed(list(self.store.path_blocks.get(path) or []))
             return {
                 "path": path,
                 "skipped": True,
@@ -195,7 +247,9 @@ class KnowledgeBase:
             turns=turns,
             markdown=markdown,
         )
-        await self.store_document(path, markdown, metadata=meta)
+        await self.store_document(
+            path, markdown, metadata=meta, embed=embed, rebuild_index=rebuild_index
+        )
         return {
             "path": path,
             "skipped": False,

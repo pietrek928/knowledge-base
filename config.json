@@ -3,8 +3,8 @@
   "ollama": {
     "base_url": "http://127.0.0.1:11434",
     "keep_alive": "30m",
-    "timeout_s": 120,
-    "batch_size": 16
+    "timeout_s": 600,
+    "batch_size": 4
   },
   "models": [
     {
@@ -48,6 +48,5 @@
   "min_confidence": null,
   "date": { "half_life_days": 30, "weight": 0.35 },
   "query_cache_size": 256,
-  "embed_queue_size": 64,
   "metadata_max_bytes": 16384
 }

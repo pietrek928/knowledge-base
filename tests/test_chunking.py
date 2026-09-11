@@ -15,7 +15,7 @@ def test_prose_paragraphs():
 
 
 def test_code_python_functions():
-    src = '''
+    src = """
 import os
 
 def alpha():
@@ -24,7 +24,7 @@ def alpha():
 def beta(x):
     y = x + 1
     return y
-'''
+"""
     chunks = chunk_code(src, path="mod.py", token_budget=400)
     texts = " ".join(c.text for c in chunks)
     assert "def alpha" in texts

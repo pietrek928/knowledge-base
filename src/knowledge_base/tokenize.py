@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import re
 
 from knowledge_base.hashing import fold_ascii

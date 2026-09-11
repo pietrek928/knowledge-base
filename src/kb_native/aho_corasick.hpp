@@ -1,4 +1,5 @@
 #pragma once
+#include <array>
 #include <string>
 #include <utility>
 #include <vector>
@@ -12,21 +13,19 @@ struct ACHit {
 };
 
 class AhoCorasick {
- public:
-  void build(const std::vector<std::string>& patterns);
-  std::vector<ACHit> search(const std::string& text) const;
+public:
+  void build(const std::vector<std::string> &patterns);
+  std::vector<ACHit> search(const std::string &text) const;
 
- private:
+private:
   struct Node {
-    int next[256];
+    std::array<int, 256> next;
     int fail = 0;
     std::vector<int> out;
-    Node() {
-      for (int& x : next) x = -1;
-    }
+    Node() { next.fill(-1); }
   };
   std::vector<Node> nodes_;
   std::vector<std::string> patterns_;
 };
 
-}  // namespace kb
+} // namespace kb

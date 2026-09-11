@@ -1,10 +1,15 @@
-from knowledge_base.plainify import html_to_plain, markdown_to_plain, sniff_kind, to_plain
+from knowledge_base.plainify import (
+    html_to_plain,
+    markdown_to_plain,
+    sniff_kind,
+    to_plain,
+)
 
 
 def test_html_strips_tags_and_script():
     html = "<p>Hello &amp; world</p><script>evil()</script><style>.x{}</style>"
     plain = html_to_plain(html)
-    assert "Hello & world" in plain or "Hello & world" == plain
+    assert "Hello & world" in plain or plain == "Hello & world"
     assert "evil" not in plain
     assert ".x" not in plain
 

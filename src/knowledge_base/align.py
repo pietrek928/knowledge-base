@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from dataclasses import dataclass
 
 from knowledge_base.chunk_code import chunk_code, language_for_path

@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """Import Google Takeout Gemini Activity into the knowledge base."""
 
-from __future__ import annotations
-
 import argparse
 import asyncio
 import sys
@@ -28,7 +26,12 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Parse and print conversation counts without writing",
     )
-    p.add_argument("--fake-ollama", action="store_true", help="Skip real Ollama embeds")
+    p.add_argument("--fake-ollama", action="store_true", help="Use fake embeddings (no Ollama)")
+    p.add_argument(
+        "--skip-embed",
+        action="store_true",
+        help="Store only; leave embeddings for a later backfill",
+    )
     args = p.parse_args(argv)
 
     try:
@@ -52,47 +55,70 @@ def main(argv: list[str] | None = None) -> int:
     cfg = load_config(args.config)
     kb = KnowledgeBase(cfg, fake_ollama=args.fake_ollama)
 
-    async def _run() -> tuple[int, int]:
-        pending = kb.missing_embed_hashes()
-        if pending:
-            print(
-                f"Note: {len(pending)} block(s) still need embeddings "
-                "(from a prior run); queuing in background…"
-            )
-        print("Prewarming Ollama…")
-        await kb.start(backfill=True)
+    async def _run() -> tuple[int, int, bool, int]:
+        await kb.start(backfill=False)
         stored = skipped = 0
+        interrupted = False
+        left = 0
         try:
-            async for conv in tqdm(
-                list(conversations.values()),
-                desc="ingest",
-                unit="chat",
-            ):
+            print("Phase 1/3: store conversations (no per-doc embed/rebuild)…")
+            async for conv in tqdm(list(conversations.values()), desc="store", unit="chat"):
                 result = await kb.ingest_gemini(
                     conversation_id=conv["conversation_id"],
                     title=conv.get("title"),
                     turns=conv["turns"],
                     ingest="takeout",
+                    embed=False,
+                    rebuild_index=False,
                 )
                 if result.get("skipped"):
                     skipped += 1
                 else:
                     stored += 1
-        finally:
-            qsize = kb._embed_q.qsize() if kb._embed_q is not None else 0
-            if qsize:
-                print(f"Draining embed queue ({qsize}+ pending)…")
-            else:
-                print("Finishing embeds…")
-            await kb.stop()
-        return stored, skipped
 
+            print("Phase 2/3: rebuild lexical index…")
+            await kb.rebuild_index()
+
+            if args.skip_embed:
+                print("Phase 3/3: skipped (--skip-embed)")
+            else:
+                missing = kb.missing_embed_hashes()
+                n = len(missing)
+                print(f"Phase 3/3: queue {n} embed(s)…")
+                kb.submit_embed(missing)
+                with tqdm(total=n or 1, desc="embed", unit="block", disable=n == 0) as bar:
+                    drain = asyncio.create_task(kb.drain_embeds())
+                    last = 0
+                    while not drain.done():
+                        done = n - kb.pending_embed_count()
+                        if done > last:
+                            bar.update(done - last)
+                            last = done
+                        await asyncio.wait({drain}, timeout=0.25)
+                    await drain
+                    if bar.n < n:
+                        bar.update(n - bar.n)
+            left = len(kb.missing_embed_hashes())
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            interrupted = True
+            left = len(kb.missing_embed_hashes())
+            print("\nInterrupted — leaving remaining embeds for later backfill.", file=sys.stderr)
+        finally:
+            await kb.stop(drain=not interrupted and not args.skip_embed)
+        return stored, skipped, interrupted, left
+
+    left = 0
     try:
-        stored, skipped = asyncio.run(_run())
+        stored, skipped, interrupted, left = asyncio.run(_run())
     except KeyboardInterrupt:
         print("\nInterrupted.", file=sys.stderr)
         return 130
-    print(f"Done: stored={stored} skipped={skipped}")
+
+    print(f"Done: stored={stored} skipped={skipped} missing_embeds={left}")
+    if interrupted:
+        return 130
+    if left > 0 and not args.skip_embed:
+        return 1
     return 0
 
 

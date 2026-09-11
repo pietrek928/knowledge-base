@@ -1,8 +1,6 @@
-from __future__ import annotations
-
 import threading
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -14,7 +12,7 @@ from knowledge_base.plainify import to_plain
 
 
 def utc_now() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    return datetime.now(UTC).replace(microsecond=0).isoformat()
 
 
 @dataclass
@@ -85,7 +83,9 @@ class ContentStore:
         with self._lock:
             return dict(self.path_metadata.get(path) or {})
 
-    def merged_metadata(self, path: str, block_meta: dict[str, Any] | None = None) -> dict[str, Any]:
+    def merged_metadata(
+        self, path: str, block_meta: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         """Doc metadata merged with block metadata; block keys win on conflict."""
         with self._lock:
             out = dict(self.path_metadata.get(path) or {})

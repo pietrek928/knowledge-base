@@ -1,7 +1,3 @@
-from __future__ import annotations
-
-from dataclasses import dataclass
-
 from knowledge_base.chunk_prose import Chunk, chunk_prose
 from knowledge_base.tokenize import tokenize
 

@@ -29,6 +29,16 @@ Optional: run Ollama locally and pull the embedding models. Tests always use fak
 uv run pytest
 ```
 
+## Lint
+
+```bash
+uv run ruff check --fix src scripts tests
+uv run ruff format src scripts tests
+clang-format -i src/kb_native/**/*.{cpp,hpp}
+# optional, if installed:
+# clang-tidy -p build src/kb_native/**/*.cpp
+```
+
 ## Run
 
 ```bash
@@ -68,11 +78,16 @@ uv run python scripts/import_gemini_takeout.py /path/to/MyActivity.html
 # Preview without writing
 uv run python scripts/import_gemini_takeout.py /path/to/takeout.zip --dry-run
 
-# Without Ollama while embedding
+# Fake embeddings (no Ollama)
 uv run python scripts/import_gemini_takeout.py /path/to/takeout.zip --fake-ollama
+
+# Store + index only; embed later (or after Ctrl+C)
+uv run python scripts/import_gemini_takeout.py /path/to/takeout.zip --skip-embed
 ```
 
-Re-runs are safe: unchanged conversations are skipped via `content_fingerprint`.
+Import runs in phases: **store** (never waits on Ollama) → **one lexical rebuild** → **embed drain**. Ctrl+C skips draining so ingest does not hang; missing embeds can be filled on the next run or by the server backfill. Re-runs skip unchanged chats via `content_fingerprint`.
+
+Document embeds run **one model at a time**. If Takeout hits `ReadTimeout`, raise `ollama.timeout_s` (default 600) and/or lower `ollama.batch_size` (default 4) in `config.json`. `drain_embeds` only waits for the queue to empty — failed batches still appear in `missing_embeds` until a later backfill.
 
 ### Extension (Chrome / Brave)
 
@@ -120,7 +135,9 @@ Environment="OLLAMA_NUM_PARALLEL=2"
 sudo systemctl daemon-reload && sudo systemctl restart ollama
 ```
 
-`OLLAMA_NUM_PARALLEL` runs multiple requests at once (useful for this KB’s embed queue); it does **not** replace `num_thread` / `OLLAMA_NUM_THREADS`. Prefer physical-core count first, then benchmark.
+`OLLAMA_NUM_PARALLEL` runs multiple requests at once (useful for **search** dual-query embeds or other clients). The document embed worker already serializes models, so parallel is **not** required for Takeout/backfill. It does **not** replace `num_thread` / `OLLAMA_NUM_THREADS`. Prefer physical-core count first, then benchmark.
+
+This KB sends `options.num_thread` on every `/api/embed` call (default: logical CPUs ÷ 2). Override with `ollama.num_thread` or per-model `models[].num_thread` in `config.json`. systemd `OLLAMA_NUM_THREADS` is often ignored by the runner.
 
 ## systemd
 

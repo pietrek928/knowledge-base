@@ -1,12 +1,15 @@
 """Tests for Takeout HTML/JSON parsing and import skip behavior."""
 
-from __future__ import annotations
-
+from datetime import UTC
 from pathlib import Path
 
 import pytest
 
-from knowledge_base.gemini_takeout import load_takeout, parse_activity_datetime, parse_myactivity_html
+from knowledge_base.gemini_takeout import (
+    load_takeout,
+    parse_activity_datetime,
+    parse_myactivity_html,
+)
 from knowledge_base.service import KnowledgeBase
 
 FIXTURE = Path(__file__).parent / "fixtures" / "gemini" / "MyActivity_sample.html"
@@ -42,7 +45,6 @@ def _cfg(tmp_path):
         "min_confidence": None,
         "date": {"half_life_days": 30, "weight": 0.0},
         "query_cache_size": 8,
-        "embed_queue_size": 8,
         "metadata_max_bytes": 4096,
         "ollama": {
             "base_url": "http://127.0.0.1:9",
@@ -58,9 +60,9 @@ def test_parse_activity_datetime_cest():
     assert sec is not None
     assert nanos == 0
     # 18:52 CEST = 16:52 UTC
-    from datetime import datetime, timezone
+    from datetime import datetime
 
-    dt = datetime.fromtimestamp(sec, tz=timezone.utc)
+    dt = datetime.fromtimestamp(sec, tz=UTC)
     assert dt.year == 2026 and dt.month == 9 and dt.day == 10
     assert dt.hour == 16 and dt.minute == 52
 

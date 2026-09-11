@@ -1,14 +1,13 @@
 """Canonical Gemini conversation formatting (single owner for path/markdown/fingerprint)."""
 
-from __future__ import annotations
-
 import hashlib
 import re
-from datetime import datetime, timezone
-from typing import Any, Mapping, Sequence
+from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime
+from typing import Any
 
-_EPOCH_MIN = int(datetime(2015, 1, 1, tzinfo=timezone.utc).timestamp())
-_EPOCH_MAX = int(datetime(2100, 1, 1, tzinfo=timezone.utc).timestamp())
+_EPOCH_MIN = int(datetime(2015, 1, 1, tzinfo=UTC).timestamp())
+_EPOCH_MAX = int(datetime(2100, 1, 1, tzinfo=UTC).timestamp())
 _ROLE_LABEL = {"user": "User", "gemini": "Gemini"}
 
 
@@ -31,7 +30,7 @@ def to_iso_z(ts_sec: int | float | None, ts_nanos: int | float | None = 0) -> st
         return None
     if sec < _EPOCH_MIN or sec > _EPOCH_MAX:
         return None
-    dt = datetime.fromtimestamp(sec, tz=timezone.utc).replace(microsecond=0)
+    dt = datetime.fromtimestamp(sec, tz=UTC).replace(microsecond=0)
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 

@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import html as html_lib
 import re
 from html.parser import HTMLParser

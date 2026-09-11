@@ -4,12 +4,12 @@
 
 namespace kb {
 
-void AhoCorasick::build(const std::vector<std::string>& patterns) {
+void AhoCorasick::build(const std::vector<std::string> &patterns) {
   patterns_ = patterns;
   nodes_.clear();
   nodes_.emplace_back();
   for (int pid = 0; pid < static_cast<int>(patterns.size()); ++pid) {
-    const auto& p = patterns[pid];
+    const auto &p = patterns[pid];
     int v = 0;
     for (unsigned char ch : p) {
       if (nodes_[v].next[ch] == -1) {
@@ -40,16 +40,17 @@ void AhoCorasick::build(const std::vector<std::string>& patterns) {
         continue;
       }
       nodes_[u].fail = nodes_[nodes_[v].fail].next[c];
-      auto& fout = nodes_[nodes_[u].fail].out;
+      auto &fout = nodes_[nodes_[u].fail].out;
       nodes_[u].out.insert(nodes_[u].out.end(), fout.begin(), fout.end());
       q.push(u);
     }
   }
 }
 
-std::vector<ACHit> AhoCorasick::search(const std::string& text) const {
+std::vector<ACHit> AhoCorasick::search(const std::string &text) const {
   std::vector<ACHit> hits;
-  if (nodes_.empty()) return hits;
+  if (nodes_.empty())
+    return hits;
   int v = 0;
   for (int i = 0; i < static_cast<int>(text.size()); ++i) {
     unsigned char ch = static_cast<unsigned char>(text[i]);
@@ -66,4 +67,4 @@ std::vector<ACHit> AhoCorasick::search(const std::string& text) const {
   return hits;
 }
 
-}  // namespace kb
+} // namespace kb

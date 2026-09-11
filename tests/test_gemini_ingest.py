@@ -1,7 +1,5 @@
 """Golden + unit tests for gemini_format and ingest_gemini."""
 
-from __future__ import annotations
-
 import pytest
 from httpx import ASGITransport, AsyncClient
 
@@ -44,7 +42,6 @@ def _cfg(tmp_path):
         "min_confidence": None,
         "date": {"half_life_days": 30, "weight": 0.0},
         "query_cache_size": 8,
-        "embed_queue_size": 8,
         "metadata_max_bytes": 4096,
         "ollama": {
             "base_url": "http://127.0.0.1:9",
@@ -146,7 +143,9 @@ async def test_ingest_gemini_skip_and_docs(app, tmp_path):
         # doc metadata once on disk, not on every block
         import orjson
 
-        disk = orjson.loads((tmp_path / "kb" / "content" / "gemini" / "deadbeef.md.json").read_bytes())
+        disk = orjson.loads(
+            (tmp_path / "kb" / "content" / "gemini" / "deadbeef.md.json").read_bytes()
+        )
         assert disk["metadata"]["conversation_id"] == "deadbeef"
         for b in disk["blocks"]:
             assert "source" not in (b.get("metadata") or {})
