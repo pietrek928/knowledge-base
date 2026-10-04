@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from knowledge_base.plainify import to_plain
+from knowledge_base.plainify import html_to_markdown
 
 _APP_ID_RE = re.compile(r"https://gemini\.google\.com/app/([a-f0-9]+)", re.IGNORECASE)
 _PROMPTED_RE = re.compile(r"^Prompted[\u00a0\s]+", re.IGNORECASE)
@@ -66,7 +66,7 @@ def parse_activity_datetime(caption: str) -> tuple[int | None, int]:
 def _html_to_text(html: str) -> str:
     if not html or not html.strip():
         return ""
-    return to_plain(html, kind="html").strip()
+    return html_to_markdown(html).strip()
 
 
 def _split_body(body_html: str) -> tuple[str, str | None, str]:

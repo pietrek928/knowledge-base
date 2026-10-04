@@ -107,6 +107,33 @@ class ContentStore:
                 for p in paths
             ]
 
+    def get_document(self, path: str) -> dict[str, Any] | None:
+        """Full document with ordered blocks, or None if unknown path."""
+        with self._lock:
+            hashes = self.path_blocks.get(path)
+            if hashes is None:
+                return None
+            blocks: list[dict[str, Any]] = []
+            for h in hashes:
+                bref = self.blocks.get(h)
+                if not bref:
+                    continue
+                block: dict[str, Any] = {
+                    "hash": bref.hash,
+                    "index": bref.index,
+                    "text": bref.text,
+                    "source": bref.source,
+                    "created_at": bref.created_at,
+                    "updated_at": bref.updated_at,
+                    "metadata": dict(bref.metadata or {}),
+                }
+                blocks.append(block)
+            return {
+                "path": path,
+                "metadata": dict(self.path_metadata.get(path) or {}),
+                "blocks": blocks,
+            }
+
     def store(
         self,
         path: str,

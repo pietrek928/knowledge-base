@@ -52,8 +52,32 @@ async def test_health_and_store_search(app):
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         r = await client.get("/health")
         assert r.status_code == 200
+        assert r.json()["status"] == "ok"
+        assert r.json()["embeddings"] is True
         r = await client.post("/store", json={"path": "t.md", "content": "alpha beta gamma"})
         assert r.status_code == 200
+        assert r.json()["embeddings"] is True
         r = await client.post("/search", json={"phrases": ["alpha"], "limit": 5})
         assert r.status_code == 200
         assert "results" in r.json()
+
+
+@pytest.mark.asyncio
+async def test_get_document(app):
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        content = "# Title\n\nHello **world** and more text for a block."
+        r = await client.post("/store", json={"path": "notes/doc.md", "content": content})
+        assert r.status_code == 200
+        r = await client.get("/docs/notes/doc.md")
+        assert r.status_code == 200
+        doc = r.json()
+        assert doc["path"] == "notes/doc.md"
+        assert doc["blocks"]
+        assert "text" in doc["blocks"][0]
+        assert "source" in doc["blocks"][0]
+        r = await client.get("/docs/missing/nope.md")
+        assert r.status_code == 404
+        r = await client.get("/browse/notes/doc.md")
+        assert r.status_code == 200
+        assert "text/html" in r.headers.get("content-type", "")

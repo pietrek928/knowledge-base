@@ -79,8 +79,8 @@ def create_app(cfg: dict[str, Any] | None = None, *, fake_ollama: bool | None = 
     )
 
     @app.get("/health")
-    async def health() -> dict[str, str]:
-        return {"status": "ok"}
+    async def health() -> dict[str, Any]:
+        return {"status": "ok", "embeddings": kb.embeddings_enabled}
 
     @app.post("/store")
     async def store(req: StoreRequest) -> dict[str, Any]:
@@ -112,6 +112,13 @@ def create_app(cfg: dict[str, Any] | None = None, *, fake_ollama: bool | None = 
     async def list_docs(prefix: str | None = Query(None)) -> dict[str, Any]:
         return {"docs": kb.list_docs(prefix=prefix)}
 
+    @app.get("/docs/{doc_path:path}")
+    async def get_document(doc_path: str) -> dict[str, Any]:
+        doc = kb.get_document(doc_path)
+        if doc is None:
+            raise HTTPException(404, "document not found")
+        return doc
+
     @app.post("/search")
     async def search(req: SearchRequest, request: Request) -> dict[str, Any]:
         body = req.model_dump(exclude_none=True)
@@ -136,6 +143,11 @@ def create_app(cfg: dict[str, Any] | None = None, *, fake_ollama: bool | None = 
 
     @app.get("/")
     async def index_page() -> FileResponse:
+        return FileResponse(_STATIC / "index.html")
+
+    @app.get("/browse/{doc_path:path}")
+    async def browse_page(doc_path: str) -> FileResponse:
+        """SPA shell for path-based document browsing (client loads /docs/…)."""
         return FileResponse(_STATIC / "index.html")
 
     if _STATIC.exists():

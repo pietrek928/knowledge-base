@@ -29,6 +29,8 @@ Optional: run Ollama locally and pull the embedding models. Tests always use fak
 uv run pytest
 ```
 
+**Lexical-only (no Ollama):** set `"models": []` or `"ollama": {"enabled": false}` in `config.json`. Search uses exact/fuzzy/BM25 only; store/ingest still write content and rebuild the lexical index (no embed queue). Re-enable models later and backfill embeds when ready.
+
 ## Lint
 
 ```bash
@@ -153,3 +155,6 @@ systemctl --user enable --now knowledge-base.service
 ## Config
 
 Edit `config.json` (`data_dir`, models, fusion weights, BM25, sibling boosts, …).
+
+- Empty `"models": []` or `"ollama": {"enabled": false}` → lexical-only mode (`/health` reports `"embeddings": false`).
+- With models configured, store responses include `"embeddings": true` and the embed worker runs on startup.

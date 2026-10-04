@@ -83,12 +83,15 @@ class SearchEngine:
         index: LexicalIndex,
         vector_stores: list[VectorStore],
         ollama: OllamaClient,
+        *,
+        embeddings_enabled: bool = True,
     ) -> None:
         self.cfg = cfg
         self.store = store
         self.index = index
         self.vector_stores = vector_stores
         self.ollama = ollama
+        self.embeddings_enabled = embeddings_enabled and bool(vector_stores)
 
     def _run_lexical(
         self,
@@ -226,7 +229,7 @@ class SearchEngine:
             )
 
         async def _query_embeds() -> list[np.ndarray | None]:
-            if not self.vector_stores:
+            if not self.embeddings_enabled:
                 return []
 
             async def _one(vs: VectorStore) -> np.ndarray | None:
@@ -239,11 +242,10 @@ class SearchEngine:
             return list(await asyncio.gather(*[_one(vs) for vs in self.vector_stores]))
 
         # Identifier fast-path: run lexical first; skip embeds if strong exact hits.
-        if id_like:
+        if not self.embeddings_enabled or id_like:
             exact_scores, fuzzy_scores, bm25_scores, keyword_hits = await _lexical()
             qvecs: list[np.ndarray | None] = []
-            run_embed = not bool(exact_scores)
-            if run_embed:
+            if self.embeddings_enabled and id_like and not exact_scores:
                 qvecs = await _query_embeds()
         else:
             (exact_scores, fuzzy_scores, bm25_scores, keyword_hits), qvecs = await asyncio.gather(
@@ -252,7 +254,7 @@ class SearchEngine:
 
         embed_scores: dict[str, float] = defaultdict(float)
         embed_hits: set[str] = set()
-        if qvecs and self.vector_stores:
+        if qvecs and self.embeddings_enabled:
             retrieve_coros = []
             for vs, q in zip(self.vector_stores, qvecs):
                 if q is None:
@@ -296,6 +298,15 @@ class SearchEngine:
                     w["fuzzy"] *= scale
                     w["bm25"] *= scale
 
+        if not self.embeddings_enabled:
+            w["embed"] = 0.0
+            lex = w["exact"] + w["fuzzy"] + w["bm25"]
+            if lex > 0:
+                scale = 1.0 / lex
+                w["exact"] *= scale
+                w["fuzzy"] *= scale
+                w["bm25"] *= scale
+
         s_exact = _normalize_branch(dict(exact_scores), "max")
         s_fuzzy = _normalize_branch(dict(fuzzy_scores), "max")
         s_bm25 = _normalize_branch(dict(bm25_scores), "max")
@@ -308,8 +319,9 @@ class SearchEngine:
                 sorted(s_exact, key=lambda h: s_exact[h], reverse=True),
                 sorted(s_fuzzy, key=lambda h: s_fuzzy[h], reverse=True),
                 sorted(s_bm25, key=lambda h: s_bm25[h], reverse=True),
-                sorted(s_embed, key=lambda h: s_embed[h], reverse=True),
             ]
+            if self.embeddings_enabled and s_embed:
+                lists.append(sorted(s_embed, key=lambda h: s_embed[h], reverse=True))
             fused = _rrf(lists, int(body.get("rrf_k", self.cfg.get("rrf_k", 60))))
         else:
             fused = {}

@@ -172,19 +172,275 @@
     );
   }
 
-  function renderBody(item) {
-    const src = item.source || item.text || "";
-    const kind = sniff(src);
+  function fenceLineInfo(line) {
+    const m = /^( {0,3})([`~]{3,})(.*)$/.exec(String(line).replace(/\r$/, ""));
+    if (!m) return null;
+    return { tick: m[2][0], n: m[2].length };
+  }
+
+  function updateFenceStack(src, stack) {
+    const next = stack.slice();
+    const lines = String(src || "").split("\n");
+    for (const line of lines) {
+      const info = fenceLineInfo(line);
+      if (!info) continue;
+      if (!next.length) {
+        next.push(info);
+        continue;
+      }
+      const top = next[next.length - 1];
+      if (info.tick === top.tick && info.n >= top.n) next.pop();
+      else next.push(info);
+    }
+    return next;
+  }
+
+  function looksLikeCode(src) {
+    const text = String(src || "");
+    if (!text.trim()) return false;
+    if (/^\s*(def |class |import |from |async def )/m.test(text)) return true;
+    const lines = text.split("\n").filter((l) => l.trim().length);
+    if (lines.length < 2) return false;
+    const indented = lines.filter((l) => /^(?: {2,}|\t)/.test(l)).length;
+    return indented >= 2 && indented >= lines.length * 0.3;
+  }
+
+  function repairMarkdownSource(src, opts) {
+    const options = opts || {};
+    let stack = Array.isArray(options.fenceStack) ? options.fenceStack.slice() : [];
+    let display = String(src || "");
+    const startedOpen = stack.length > 0;
+    if (startedOpen) display = "```\n" + display;
+    stack = updateFenceStack(src, stack);
+    if (stack.length > 0) {
+      display += display.endsWith("\n") ? "```" : "\n```";
+    }
+    return { display, fenceStack: stack };
+  }
+
+  function matchNeedles(item) {
+    const text = item && item.text ? String(item.text) : "";
+    const needles = [];
+    for (const m of (item && item.matches) || []) {
+      if (m && typeof m.start === "number" && typeof m.end === "number" && text) {
+        const sub = text.slice(m.start, m.end);
+        if (sub) needles.push(sub);
+      }
+      if (m && m.text) needles.push(String(m.text));
+    }
+    return [...new Set(needles)].sort((a, b) => b.length - a.length);
+  }
+
+  function highlightHtml(html, item) {
+    const needles = matchNeedles(item);
+    if (!needles.length || !html) return html;
+    const root = document.createElement("div");
+    root.innerHTML = html;
+    const skip = new Set(["MARK", "SCRIPT", "STYLE"]);
+
+    function wrapNode(node, needle) {
+      const value = node.nodeValue;
+      if (!value) return;
+      const parts = value.split(needle);
+      if (parts.length < 2) return;
+      const frag = document.createDocumentFragment();
+      parts.forEach((part, idx) => {
+        if (part) frag.appendChild(document.createTextNode(part));
+        if (idx < parts.length - 1) {
+          const mark = document.createElement("mark");
+          mark.textContent = needle;
+          frag.appendChild(mark);
+        }
+      });
+      node.parentNode.replaceChild(frag, node);
+    }
+
+    function walk(node, needle) {
+      if (!node) return;
+      if (node.nodeType === 1 && skip.has(node.nodeName)) return;
+      if (node.nodeType === 3) {
+        wrapNode(node, needle);
+        return;
+      }
+      const children = Array.from(node.childNodes);
+      for (const child of children) walk(child, needle);
+    }
+
+    for (const needle of needles) walk(root, needle);
+    return root.innerHTML;
+  }
+
+  function ensureMarkedOptions() {
+    if (!window.marked || marked.__kbConfigured) return;
+    marked.setOptions({ breaks: true, gfm: true });
+    marked.__kbConfigured = true;
+  }
+
+  function renderBody(item, opts) {
+    const options = opts || {};
+    let src = item.source || item.text || "";
+    let kind = sniff(src);
+    let fenceStack = Array.isArray(options.fenceStack) ? options.fenceStack : [];
+
+    if (kind === "plain" && fenceStack.length > 0) {
+      // Continuation of a torn fence from the previous browse block.
+      kind = "markdown";
+    } else if (kind === "plain" && looksLikeCode(src)) {
+      src = "```\n" + src.replace(/\s*$/, "") + "\n```";
+      kind = "markdown";
+    }
+
     if (kind === "markdown" && window.marked && window.DOMPurify) {
-      return DOMPurify.sanitize(marked.parse(src));
+      ensureMarkedOptions();
+      const repaired = repairMarkdownSource(src, { fenceStack });
+      fenceStack = repaired.fenceStack;
+      let html = DOMPurify.sanitize(marked.parse(repaired.display), {
+        ADD_TAGS: ["mark"],
+      });
+      html = highlightHtml(html, item);
+      return { html, fenceStack };
     }
     if (kind === "html" && window.DOMPurify) {
-      return DOMPurify.sanitize(src);
+      let html = DOMPurify.sanitize(src, { ADD_TAGS: ["mark"] });
+      html = highlightHtml(html, item);
+      return { html, fenceStack };
     }
-    return highlight(item.text || src, item.matches);
+    return {
+      html: `<div class="plain-body">${highlight(item.text || src, item.matches)}</div>`,
+      fenceStack,
+    };
+  }
+
+  let lastResultsData = null;
+  let browsing = false;
+
+  function showResultsPanel() {
+    browsing = false;
+    const rp = $("results_panel");
+    const bp = $("browse_panel");
+    if (rp) {
+      rp.classList.remove("hidden");
+      rp.hidden = false;
+    }
+    if (bp) {
+      bp.classList.add("hidden");
+      bp.hidden = true;
+    }
+  }
+
+  function showBrowsePanel() {
+    browsing = true;
+    const rp = $("results_panel");
+    const bp = $("browse_panel");
+    if (rp) {
+      rp.classList.add("hidden");
+      rp.hidden = true;
+    }
+    if (bp) {
+      bp.classList.remove("hidden");
+      bp.hidden = false;
+    }
+  }
+
+  function browseUrl(path, hash) {
+    const segs = String(path)
+      .split("/")
+      .filter((s) => s.length)
+      .map(encodeURIComponent);
+    let url = "/browse/" + segs.join("/");
+    if (hash) url += "?h=" + encodeURIComponent(hash);
+    return url;
+  }
+
+  function setBrowseUrl(path, hash) {
+    const next = browseUrl(path, hash || "");
+    const cur = location.pathname + location.search;
+    if (cur !== next) history.pushState(null, "", next);
+  }
+
+  function clearBrowseUrl() {
+    if (location.pathname.startsWith("/browse/")) {
+      history.pushState(null, "", "/");
+    }
+  }
+
+  function parseBrowsePath() {
+    const m = location.pathname.match(/^\/browse\/(.+)$/);
+    if (!m) return null;
+    const path = m[1]
+      .split("/")
+      .map((s) => decodeURIComponent(s))
+      .join("/");
+    const hash = new URLSearchParams(location.search).get("h") || "";
+    return { path, hash };
+  }
+
+  async function openBrowse(path, hitHash, matches, opts) {
+    if (!path) return;
+    const updateUrl = !opts || opts.updateUrl !== false;
+    showBrowsePanel();
+    $("browse_title").textContent = path;
+    $("browse_meta").textContent = "loading…";
+    $("browse_body").innerHTML = "";
+    if (updateUrl) setBrowseUrl(path, hitHash || "");
+    try {
+      const docApi =
+        "/docs/" +
+        String(path)
+          .split("/")
+          .filter((s) => s.length)
+          .map(encodeURIComponent)
+          .join("/");
+      const res = await fetch(docApi, { cache: "no-store" });
+      if (!res.ok) {
+        $("browse_meta").textContent = res.status === 404 ? "document not found" : "failed to load";
+        return;
+      }
+      const doc = await res.json();
+      const title = (doc.metadata && doc.metadata.title) || path;
+      $("browse_title").textContent = title;
+      const n = (doc.blocks || []).length;
+      $("browse_meta").textContent = `${path} · ${n} block${n === 1 ? "" : "s"}`;
+      const root = $("browse_body");
+      root.innerHTML = "";
+      let hitEl = null;
+      let fenceStack = [];
+      for (const b of doc.blocks || []) {
+        const el = document.createElement("article");
+        el.className = "browse-block";
+        el.dataset.hash = b.hash || "";
+        if (hitHash && b.hash === hitHash) {
+          el.classList.add("block-hit");
+          hitEl = el;
+        }
+        const item = {
+          source: b.source,
+          text: b.text,
+          matches: hitHash && b.hash === hitHash ? matches || [] : [],
+        };
+        const rendered = renderBody(item, { fenceStack });
+        fenceStack = rendered.fenceStack || [];
+        el.innerHTML = `
+          <div class="block-meta">#${b.index} · ${escapeHtml((b.hash || "").slice(0, 16))}…</div>
+          <div class="body">${rendered.html}</div>`;
+        root.appendChild(el);
+      }
+      if (hitEl) {
+        requestAnimationFrame(() => hitEl.scrollIntoView({ block: "center", behavior: "smooth" }));
+      }
+    } catch (e) {
+      $("browse_meta").textContent = e.message || "failed to load";
+    }
+  }
+
+  function closeBrowse() {
+    showResultsPanel();
+    clearBrowseUrl();
   }
 
   function renderResults(data) {
+    lastResultsData = data;
+    showResultsPanel();
     const root = $("results");
     root.innerHTML = "";
     const results = (data && data.results) || [];
@@ -195,18 +451,30 @@
     for (const r of results) {
       const el = document.createElement("article");
       el.className = "result";
+      el.tabIndex = 0;
+      el.setAttribute("role", "button");
+      el.setAttribute("aria-label", `Open ${r.path || "document"}`);
       el.innerHTML = `
         <div class="meta">
           <span class="path">${escapeHtml(r.path || "")}</span>
           <span class="score">score ${Number(r.score).toFixed(4)} · conf ${Number(r.confidence).toFixed(4)}</span>
           <span>#${r.index} · ${escapeHtml(r.hash || "").slice(0, 16)}…</span>
         </div>
-        <div class="body">${renderBody(r)}</div>`;
+        <div class="body">${renderBody(r).html}</div>`;
+      const open = () => openBrowse(r.path, r.hash, r.matches);
+      el.addEventListener("click", open);
+      el.addEventListener("keydown", (ev) => {
+        if (ev.key === "Enter" || ev.key === " ") {
+          ev.preventDefault();
+          open();
+        }
+      });
       root.appendChild(el);
     }
   }
 
   async function runSearch() {
+    if (browsing) return;
     const body = readParams();
     if (!body.phrases.length) {
       $("results").innerHTML = "";
@@ -230,6 +498,15 @@
       if (e.name === "AbortError") return;
       $("status").textContent = "error";
     }
+  }
+
+  async function syncBrowseFromPath() {
+    const loc = parseBrowsePath();
+    if (!loc) {
+      if (browsing) showResultsPanel();
+      return;
+    }
+    await openBrowse(loc.path, loc.hash, [], { updateUrl: false });
   }
 
   function scheduleSearch() {
@@ -298,5 +575,13 @@
     localStorage.setItem(LS_KEY, JSON.stringify(all));
     loadConfigList();
   });
+  on("browse_back", "click", () => {
+    closeBrowse();
+    if (lastResultsData) renderResults(lastResultsData);
+  });
+  window.addEventListener("popstate", () => {
+    syncBrowseFromPath();
+  });
   loadConfigList();
+  syncBrowseFromPath();
 })();

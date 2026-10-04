@@ -17,6 +17,19 @@ from knowledge_base.vectors import VectorStore
 log = logging.getLogger(__name__)
 
 
+def embeddings_configured(cfg: dict[str, Any]) -> bool:
+    """True when models are set and Ollama is not explicitly disabled."""
+    if not list(cfg.get("models") or []):
+        return False
+    if "ollama" in cfg:
+        o = cfg["ollama"]
+        if o is False or o is None:
+            return False
+        if isinstance(o, dict) and o.get("enabled") is False:
+            return False
+    return True
+
+
 class KnowledgeBase:
     def __init__(self, cfg: dict[str, Any] | None = None, *, fake_ollama: bool = False) -> None:
         self.cfg = cfg or load_config()
@@ -30,23 +43,32 @@ class KnowledgeBase:
             bm25_k1=float(bm.get("k1", 0.9)),
             bm25_b=float(bm.get("b", 0.75)),
         )
-        self.models = list(self.cfg.get("models") or [])
+        self.embeddings_enabled = embeddings_configured(self.cfg)
+        self.models = list(self.cfg.get("models") or []) if self.embeddings_enabled else []
         self.vector_stores = [VectorStore(self.data_dir, m) for m in self.models]
         self.ollama = OllamaClient(self.cfg, self.models)
         if fake_ollama:
             self.ollama.enable_fake()
         self.search_engine = SearchEngine(
-            self.cfg, self.store, self.index, self.vector_stores, self.ollama
+            self.cfg,
+            self.store,
+            self.index,
+            self.vector_stores,
+            self.ollama,
+            embeddings_enabled=self.embeddings_enabled,
         )
         self._embed_q: asyncio.Queue[str] | None = None
         self._embed_task: asyncio.Task | None = None
         self._embed_queued: set[str] = set()
         self._embed_queued_lock = threading.Lock()
         self._lock = threading.RLock()
-        self._batch_size = int((self.cfg.get("ollama") or {}).get("batch_size", 4))
+        ollama_cfg = self.cfg.get("ollama") if isinstance(self.cfg.get("ollama"), dict) else {}
+        self._batch_size = int((ollama_cfg or {}).get("batch_size", 4))
 
     async def start(self, *, backfill: bool = True) -> None:
-        """Start the single embed worker. Optionally queue missing embeds (non-blocking)."""
+        """Start the embed worker when embeddings are configured."""
+        if not self.embeddings_enabled:
+            return
         self._embed_q = asyncio.Queue()  # unbounded — store must never block on put
         self._embed_task = asyncio.create_task(self._embed_worker())
         await self.ollama.prewarm()
@@ -76,7 +98,7 @@ class KnowledgeBase:
 
     def submit_embed(self, hashes: list[str]) -> int:
         """Non-blocking enqueue. Returns number newly queued. Safe during store."""
-        if self._embed_q is None or not hashes:
+        if not self.embeddings_enabled or self._embed_q is None or not hashes:
             return 0
         n = 0
         with self._embed_queued_lock:
@@ -90,6 +112,8 @@ class KnowledgeBase:
 
     def missing_embed_hashes(self) -> list[str]:
         """Non-empty block hashes missing from at least one vector store."""
+        if not self.embeddings_enabled:
+            return []
         hashes = [b.hash for b in self.store.all_blocks() if (b.text or "").strip()]
         seen: set[str] = set()
         out: list[str] = []
@@ -102,6 +126,8 @@ class KnowledgeBase:
 
     async def backfill_missing(self) -> int:
         """Queue missing embeddings and wait until drained (tests / explicit catch-up)."""
+        if not self.embeddings_enabled:
+            return 0
         missing = self.missing_embed_hashes()
         self.submit_embed(missing)
         await self.drain_embeds()
@@ -183,6 +209,8 @@ class KnowledgeBase:
         embed: bool = True,
         rebuild_index: bool = True,
     ) -> dict[str, Any]:
+        if not self.embeddings_enabled:
+            embed = False
         with self._lock:
             blocks = self.store.store(
                 path,
@@ -199,10 +227,14 @@ class KnowledgeBase:
         return {
             "path": path,
             "blocks": [{"hash": b.hash, "index": b.index, "text": b.text} for b in blocks],
+            "embeddings": self.embeddings_enabled,
         }
 
     def list_docs(self, *, prefix: str | None = None) -> list[dict[str, Any]]:
         return self.store.list_docs(prefix=prefix)
+
+    def get_document(self, path: str) -> dict[str, Any] | None:
+        return self.store.get_document(path)
 
     async def ingest_gemini(
         self,
@@ -225,6 +257,8 @@ class KnowledgeBase:
             raise ValueError("conversation_id required")
         if ingest not in ("takeout", "extension"):
             raise ValueError("ingest must be 'takeout' or 'extension'")
+        if not self.embeddings_enabled:
+            embed = False
         path = path_for(conversation_id)
         markdown = format_markdown(title, turns)
         fp = fingerprint(markdown)
@@ -239,6 +273,7 @@ class KnowledgeBase:
                 "skipped": True,
                 "content_fingerprint": fp,
                 "message_count": int(existing.get("message_count") or message_count),
+                "embeddings": self.embeddings_enabled,
             }
         meta = build_doc_metadata(
             conversation_id=conversation_id,
@@ -247,7 +282,7 @@ class KnowledgeBase:
             turns=turns,
             markdown=markdown,
         )
-        await self.store_document(
+        result = await self.store_document(
             path, markdown, metadata=meta, embed=embed, rebuild_index=rebuild_index
         )
         return {
@@ -255,6 +290,7 @@ class KnowledgeBase:
             "skipped": False,
             "content_fingerprint": fp,
             "message_count": message_count,
+            "embeddings": result.get("embeddings", self.embeddings_enabled),
         }
 
     async def search(self, body: dict[str, Any]) -> dict[str, Any]:

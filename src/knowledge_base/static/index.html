@@ -4,8 +4,8 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Knowledge Base</title>
-  <link rel="stylesheet" href="/static/app.css?v=3" />
-  <script src="/static/app.js?v=3" defer></script>
+  <link rel="stylesheet" href="/static/app.css?v=8" />
+  <script src="/static/app.js?v=8" defer></script>
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js" async></script>
   <script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js" async></script>
 </head>
@@ -75,9 +75,18 @@
       </div>
     </section>
 
-    <section class="panel results-panel">
+    <section class="panel results-panel" id="results_panel">
       <h2>Results <span id="status" class="hint"></span></h2>
       <div id="results"></div>
+    </section>
+
+    <section class="panel browse-panel hidden" id="browse_panel" hidden>
+      <div class="browse-toolbar">
+        <button type="button" id="browse_back">← Back to results</button>
+        <h2 id="browse_title" class="browse-title"></h2>
+      </div>
+      <p id="browse_meta" class="hint browse-meta"></p>
+      <div id="browse_body" class="browse-body"></div>
     </section>
   </main>
 </body>

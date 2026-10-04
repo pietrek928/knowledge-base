@@ -132,6 +132,14 @@ button:hover { background: var(--accent); color: #061018; }
 .result {
   border-top: 1px solid var(--line);
   padding: 0.85rem 0;
+  cursor: pointer;
+}
+.result:hover {
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+}
+.result:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 .result .meta {
   display: flex;
@@ -146,6 +154,85 @@ button:hover { background: var(--accent); color: #061018; }
 .result .score { color: var(--hit); }
 .result .body {
   line-height: 1.45;
+}
+.plain-body {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.hidden { display: none !important; }
+.browse-panel { grid-column: 1 / -1; }
+.browse-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem 1rem;
+  align-items: center;
+  margin-bottom: 0.5rem;
+}
+.browse-title {
+  margin: 0;
+  font-size: 1.1rem;
+  font-family: var(--mono);
+  color: var(--accent);
+  word-break: break-all;
+}
+.browse-meta { margin: 0 0 0.75rem; }
+.browse-body {
+  line-height: 1.5;
+}
+.browse-block {
+  border-top: 1px solid var(--line);
+  padding: 0.85rem 0;
+  scroll-margin-top: 4rem;
+}
+.browse-block .block-meta {
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  color: var(--muted);
+  margin-bottom: 0.35rem;
+}
+.browse-block.block-hit {
+  background: color-mix(in srgb, var(--hit) 12%, transparent);
+  border-radius: 8px;
+  padding: 0.85rem 0.75rem;
+  margin: 0 -0.25rem;
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--hit) 45%, transparent);
+}
+.browse-body pre,
+.result .body pre {
+  overflow-x: auto;
+  background: #0d1218;
+  padding: 0.6rem 0.75rem;
+  border-radius: 6px;
+}
+.browse-body code,
+.result .body code { font-family: var(--mono); font-size: 0.9em; }
+.browse-body h1, .browse-body h2, .browse-body h3,
+.result .body h1, .result .body h2, .result .body h3 {
+  margin: 0.8em 0 0.35em;
+  line-height: 1.25;
+}
+.browse-body p,
+.result .body p { margin: 0.4em 0; }
+.browse-body ul, .browse-body ol,
+.result .body ul, .result .body ol { margin: 0.4em 0 0.4em 1.25em; }
+.browse-body table,
+.result .body table {
+  border-collapse: collapse;
+  margin: 0.5em 0;
+  font-size: 0.92em;
+}
+.browse-body th, .browse-body td,
+.result .body th, .result .body td {
+  border: 1px solid var(--line);
+  padding: 0.25rem 0.5rem;
+  text-align: left;
+}
+.browse-body blockquote,
+.result .body blockquote {
+  margin: 0.5em 0;
+  padding-left: 0.85em;
+  border-left: 3px solid var(--line);
+  color: var(--muted);
 }
 mark {
   background: color-mix(in srgb, var(--hit) 55%, transparent);

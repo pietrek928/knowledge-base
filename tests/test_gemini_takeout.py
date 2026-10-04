@@ -78,6 +78,28 @@ def test_parse_sample_html_preserves_polish():
     assert "Cześć" in turns[1]["text"] or "Czesc" in turns[1]["text"] or "bold" in turns[1]["text"]
 
 
+def test_parse_sample_html_preserves_answer_newlines():
+    html = FIXTURE.read_text(encoding="utf-8")
+    turns = parse_myactivity_html(html)["abc123def456"]["turns"]
+    answer = turns[1]["text"]
+    assert "def foo():\n" in answer
+    assert "    return 1" in answer
+    assert "Then:\nline two" in answer or "Then:\n line two" in answer
+
+
+def test_parse_sample_html_fences_code_and_structure():
+    html = FIXTURE.read_text(encoding="utf-8")
+    answer = parse_myactivity_html(html)["abc123def456"]["turns"][1]["text"]
+    assert "```" in answer
+    assert "def foo():" in answer
+    assert "__init__" in answer
+    # heading demoted (h3 -> ####)
+    assert "#### Example" in answer
+    assert "**bold**" in answer
+    assert "- **One**" in answer or "- **One** item" in answer
+    assert "[image: sample-shot.png]" in answer
+
+
 def test_load_takeout_path():
     convs = load_takeout(FIXTURE)
     assert len(convs) == 1
