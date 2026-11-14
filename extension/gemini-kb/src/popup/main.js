@@ -1,4 +1,4 @@
-const { MsgType, gaussMs } = globalThis.KB;
+import { MsgType, gaussMs } from "../shared/constants.js";
 
 const kbUrlEl = document.getElementById("kbUrl");
 const autoSaveEl = document.getElementById("autoSave");

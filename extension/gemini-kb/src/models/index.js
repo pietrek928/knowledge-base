@@ -1,25 +1,33 @@
 /**
  * Gemini model / effort picker helpers (DOM-fragile; shared scrape + select).
  */
-((global) => {
-  const H = () => global.KBHuman;
-  const Effort = global.KB?.Effort;
-  const gaussMs = global.KB?.gaussMs;
-  const EFFORT_VALUES = global.KB?.EFFORT_VALUES || [
-    Effort?.LOW || "low",
-    Effort?.MEDIUM || "medium",
-    Effort?.HIGH || "high",
-    Effort?.FAST || "fast",
-  ];
-  const EFFORT_ALT = EFFORT_VALUES.join("|");
-  const EFFORT_WORD_RE = new RegExp(`\\b(${EFFORT_ALT})\\b`, "i");
-  const EFFORT_START_RE = new RegExp(`^(${EFFORT_ALT})\\b`, "i");
-  const EFFORT_EXACT_RE = new RegExp(`^(${EFFORT_ALT})$`, "i");
-  const DEFAULT_EFFORT = Effort?.MEDIUM || "medium";
-  const gDelay = (mean, sigma, min, max) =>
-    typeof gaussMs === "function"
-      ? gaussMs(mean, sigma, min, max)
-      : Math.max(min, Math.min(max, Math.round(mean)));
+import * as Hns from "../human/index.js";
+import { Effort, EventType, gaussMs } from "../shared/constants.js";
+import {
+  slugify,
+  modelCoreTokens,
+  tokenTailEq,
+  chipMatches,
+  effortFromLabel,
+  isJunkChromeLabel,
+  looksLikeModelLabel,
+  isEffortOnlyLabel,
+  isModelRowLabel,
+  pickModelRow,
+  modelsFromItems as modelsFromItemsPure,
+  EFFORT_START_RE,
+  EFFORT_EXACT_RE,
+  DEFAULT_EFFORT,
+} from "./chip.js";
+
+const H = () => Hns;
+const gDelay = (mean, sigma, min, max) =>
+  typeof gaussMs === "function"
+    ? gaussMs(mean, sigma, min, max)
+    : Math.max(min, Math.min(max, Math.round(mean)));
+
+const capturePageDebugHtml = () =>
+  String(document.documentElement?.outerHTML || document.body?.outerHTML || "");
 
   const isLocked = (el) => {
     if (!el) return true;
@@ -138,21 +146,6 @@
   const labelOf = (el) =>
     (el?.getAttribute?.("aria-label") || el?.textContent || "").replace(/\s+/g, " ").trim();
 
-  const isJunkChromeLabel = (t) =>
-    /activity|settings|account|apps activity|google apps|help|history|new chat|side.?nav|menu|open conversation|close|privacy|terms/i.test(
-      t || ""
-    );
-
-  // Accept whatever Gemini paints on the mode chip (Flash/Pro or Argon/Helium/…).
-  const looksLikeModelLabel = (t) => {
-    if (!t || t.length > 100 || isJunkChromeLabel(t)) return false;
-    if (/mode picker/i.test(t)) return true;
-    if (/\b(flash|pro|ultra)\b/i.test(t)) return true;
-    if (/gemini\s*\d/i.test(t)) return true;
-    if (/\b(argon|helium|hydrogen|neon|xenon|krypton|radon|carbon)\b/i.test(t)) return true;
-    if (/\bthinking\b/i.test(t) && /\b(flash|pro|gemini|mode)\b/i.test(t)) return true;
-    return false;
-  };
 
   const activeModeFromTrigger = (t) => {
     if (!t) return null;
@@ -286,23 +279,13 @@
           el;
         const primary = row.querySelector(".picker-primary-text");
         const secondary = row.querySelector(".picker-secondary-text");
-        let t = "";
-        if (primary) {
-          t = `${primary.textContent || ""} ${secondary?.textContent || ""}`.replace(/\s+/g, " ").trim();
-        } else {
-          t = (row.getAttribute("aria-label") || row.textContent || "").replace(/\s+/g, " ").trim();
-        }
+        const t = primary
+          ? `${primary.textContent || ""} ${secondary?.textContent || ""}`.replace(/\s+/g, " ").trim()
+          : (row.getAttribute("aria-label") || row.textContent || "").replace(/\s+/g, " ").trim();
         if (t) push(row, t);
       }
     }
     return items;
-  };
-
-  const slugify = (label) => {
-    return String(label)
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "-")
-      .replace(/^-|-$/g, "");
   };
 
   const openPicker = async () => {
@@ -350,42 +333,6 @@
     return [];
   };
 
-  const effortFromLabel = (label) => {
-    const m = String(label || "").toLowerCase().match(EFFORT_WORD_RE);
-    return m ? m[1].toLowerCase() : null;
-  };
-
-  const isEffortOnlyLabel = (label) => {
-    const t = String(label || "").replace(/\s+/g, " ").trim();
-    if (!t) return true;
-    if (/^thinking(\s*level)?$/i.test(t)) return true;
-    // "Thinking High" / "Thinking Medium" chrome — not a model id.
-    if (/^thinking\s+(low|medium|high|fast)\b/i.test(t)) return true;
-    if (EFFORT_START_RE.test(t) && !/\b(flash|pro|argon|helium|carbon|ultra|gemini)\b/i.test(t)) {
-      return true;
-    }
-    if (EFFORT_EXACT_RE.test(t)) return true;
-    if (/\beffort\b/i.test(t) && t.length < 40) return true;
-    return false;
-  };
-
-  /** Real picker model rows (not Thinking level / Low|Medium|High effort lines). */
-  const isModelRowLabel = (label) => {
-    const t = String(label || "").replace(/\s+/g, " ").trim();
-    if (!t || isJunkChromeLabel(t) || isEffortOnlyLabel(t)) return false;
-    if (/^thinking\b/i.test(t) && !/\b(flash|pro|gemini|mode|argon|helium)\b/i.test(t)) {
-      return false;
-    }
-    if (looksLikeModelLabel(t)) return true;
-    if (/\b(flash|pro|ultra|argon|helium|hydrogen|neon|xenon|krypton|radon|carbon)\b/i.test(t)) {
-      return true;
-    }
-    if (/\b(flash-?lite|answers|research|analysis|complex work|everyday help)\b/i.test(t)) {
-      return true;
-    }
-    if (/^[A-Z][a-z]+(?:\s+(Low|Medium|High|Fast))?$/.test(t) && t.length <= 40) return true;
-    return false;
-  };
 
   /** Prefer `.picker-primary-text` when present (e.g. "High" from "High Extra thorough"). */
   const effortPrimaryText = (item) => {
@@ -560,6 +507,29 @@
     };
   };
 
+  const buildDebugPayload = (reason) => {
+    const html = capturePageDebugHtml();
+    return {
+      debug_html: html,
+      debug_html_length: html.length,
+      debug_reason: reason,
+      debug_url: location.href,
+      debug_title: document.title || "",
+      debug_menu: dumpMenuDebug(),
+    };
+  };
+
+  const failWithDebug = (message, reason) => {
+    const err = new Error(message);
+    Object.assign(err, buildDebugPayload(reason || message));
+    return err;
+  };
+
+  const debugThrow = (debug, message, reason) => {
+    if (debug) throw failWithDebug(message, reason);
+    throw new Error(message);
+  };
+
   const syntheticItemsFromText = () => {
     // When rows aren't proper menuitems, recover labels from visible overlay text.
     const out = [];
@@ -599,7 +569,8 @@
     return out;
   };
 
-  const scrapePickerRaw = async () => {
+  const scrapePickerRaw = async (opts = {}) => {
+    const debug = !!opts.debug;
     await openPicker();
     let raw = menuItems();
     if (raw.length <= 1) {
@@ -612,37 +583,18 @@
     }));
     let items = raw.filter((i) => !i.locked && !isJunkChromeLabel(i.label));
     if (!items.length) {
-      items = await waitForMenuItems(12);
+      items = await waitForMenuItems(debug ? 1 : 12);
     }
     return { raw, items, locked: raw.filter((i) => i.locked) };
   };
 
   const modelsFromItems = (items) => {
-    const models = [];
-    for (const it of items) {
-      if (it.locked || isEffectivelyLocked(it.el)) continue;
-      if (!isModelRowLabel(it.label)) continue;
-      const emb = effortFromLabel(it.label);
-      const baseLabel = it.label
-        .replace(new RegExp(`\\b(${EFFORT_ALT})\\b`, "gi"), "")
-        .replace(/\s+/g, " ")
-        .trim();
-      const id = slugify(baseLabel || it.label);
-      // Never invent id "thinking" from Thinking chrome.
-      if (!id || id === "thinking") continue;
-      const existing = models.find((m) => m.id === id);
-      if (existing) {
-        // Union embedded tokens only — never a shared Thinking list.
-        if (emb && !existing.efforts.includes(emb)) existing.efforts.push(emb);
-        continue;
-      }
-      models.push({
-        id,
-        label: baseLabel || it.label,
-        efforts: emb ? [emb] : [DEFAULT_EFFORT],
-      });
-    }
-    return models;
+    return modelsFromItemsPure(
+      (items || []).map((it) => ({
+        ...it,
+        locked: !!(it.locked || (it.el && isEffectivelyLocked(it.el))),
+      }))
+    );
   };
 
   const allMenuItemsMerged = () => {
@@ -663,7 +615,9 @@
     }
   };
 
-  const openThinkingLevelIfNeeded = async () => {
+  const openThinkingLevelIfNeeded = async (opts = {}) => {
+    const debug = !!opts.debug;
+    const pollMax = debug ? 2 : 10;
     let rows = collectStrictEffortRows(allMenuItemsMerged());
     if (rows.length) return rows;
     if (!pickerIsOpen()) {
@@ -676,7 +630,7 @@
     // of "Thinking level". Thinking itself is role=menuitem with aria-haspopup —
     // a submenu trigger. Clicking it when siblings exist (or instead of waiting
     // for them) hangs the picker. Never click Thinking; only poll for efforts.
-    for (let i = 0; i < 10 && !rows.length; i++) {
+    for (let i = 0; i < pollMax && !rows.length; i++) {
       throwIfAborted();
       rows = collectStrictEffortRows(allMenuItemsMerged());
       if (rows.length) break;
@@ -686,12 +640,14 @@
   };
 
   /** Wait until effort rows are stable (2 consecutive non-empty scrapes) or short settle. */
-  const waitEffortRowsStable = async () => {
+  const waitEffortRowsStable = async (opts = {}) => {
+    const debug = !!opts.debug;
+    const loopMax = debug ? 3 : 12;
     let prevLen = -1;
     let streak = 0;
-    for (let i = 0; i < 12; i++) {
+    for (let i = 0; i < loopMax; i++) {
       throwIfAborted();
-      const rows = await openThinkingLevelIfNeeded();
+      const rows = await openThinkingLevelIfNeeded(opts);
       if (rows.length) {
         if (rows.length === prevLen) {
           streak += 1;
@@ -806,6 +762,7 @@
   };
 
   const listUnlockedModels = async (params = {}, emit) => {
+    const debugMode = !!params.debug;
     let locked = [];
     let debug = {};
     let models = [];
@@ -817,17 +774,18 @@
     const ping = async (payload) => {
       if (typeof emit !== "function") return;
       try {
-        await emit(global.KB?.EventType?.MODEL_SELECTED || "model_selected", payload || {});
+        await emit(EventType.MODEL_SELECTED || "model_selected", payload || {});
       } catch (_) {
         /* keepalive best-effort */
       }
     };
     // Retry until real model rows appear (effort-only overlay looks non-empty otherwise).
-    for (let attempt = 0; attempt < 3; attempt++) {
+    const scrapeAttempts = debugMode ? 1 : 3;
+    for (let attempt = 0; attempt < scrapeAttempts; attempt++) {
       throwIfAborted();
       if (attempt > 0) await closePickerIfOpen();
       await ping({ phase: "scrape", attempt });
-      const scraped = await scrapePickerRaw();
+      const scraped = await scrapePickerRaw({ debug: debugMode });
       locked = scraped.locked;
       const discovered = discoverEffortLevelsSeen(scraped.raw);
       effort_levels_seen = discovered.labels;
@@ -843,9 +801,14 @@
       // Read-only: keep embedded/default efforts — do NOT stamp thinking_levels onto models.
       models = modelsFromItems(scraped.items);
       if (models.length) break;
+      if (debugMode) break;
       await H().sleep(H().gaussianDelay(350, 80, 200, 600));
     }
     await closePickerIfOpen();
+
+    if (debugMode && !models.length) {
+      throw failWithDebug("no unlocked models scraped", "no unlocked models scraped");
+    }
 
     // High proof: default on; set probe_high=false to scrape-only.
     // Only probe Argon (analysis SKU) — not every unlocked model.
@@ -919,68 +882,19 @@
     };
   };
 
-  const EFFORT_TOKENS = new Set(EFFORT_VALUES);
-
-  const modelCoreTokens = (label) => {
-    const slug = slugify(label);
-    if (!slug) return [];
-    return slug.split("-").filter((t) => t && !EFFORT_TOKENS.has(t));
-  };
-
-  /** Token-tail equality (not String.endsWith — flash-lite must not match flash). */
-  const tokenTailEq = (longer, shorter) => {
-    if (!shorter.length || longer.length < shorter.length) return false;
-    const n = shorter.length;
-    for (let i = 0; i < n; i++) {
-      if (longer[longer.length - n + i] !== shorter[i]) return false;
-    }
-    return true;
-  };
-
-  /**
-   * Chip / label match for post-select assert and model_changed.
-   * Accepts abbreviated chip "Argon" for want "Code & analysis 4 Argon".
-   * Rejects Flash ↔ Flash-Lite (token tails differ).
-   */
-  const chipMatches = (chip, wantRaw) => {
-    const c = modelCoreTokens(chip);
-    const w = modelCoreTokens(wantRaw);
-    if (!c.length || !w.length) return false;
-    if (c.join("-") === w.join("-")) return true;
-    return tokenTailEq(w, c) || tokenTailEq(c, w);
-  };
-
-  // Back-compat alias used by content.js / older call sites.
   const modelMatches = (label, wantRaw) => chipMatches(label, wantRaw);
 
-  /** Prefer exact core, else longest matching row (avoid clicking a short "Argon" span). */
-  const pickModelRow = (rows, want, wantEffort) => {
-    const hits = (rows || []).filter((i) => chipMatches(i.label, want));
-    if (!hits.length) return null;
-    const withEffort = hits.filter((i) => effortFromLabel(i.label) === wantEffort);
-    const pool = withEffort.length ? withEffort : hits;
-    const exact = pool.find((i) => modelCoreTokens(i.label).join("-") === modelCoreTokens(want).join("-"));
-    if (exact) return exact;
-    return pool.slice().sort((a, b) => {
-      const da = modelCoreTokens(a.label).length;
-      const db = modelCoreTokens(b.label).length;
-      if (db !== da) return db - da;
-      return String(b.label).length - String(a.label).length;
-    })[0];
-  };
-
-  const selectModelAndEffort = async (model, effort) => {
+  const selectModelAndEffort = async (model, effort, opts = {}) => {
+    const debug = !!opts.debug;
     const want = slugify(model);
     const wantEffort = (effort || DEFAULT_EFFORT).toLowerCase();
-    let items = [];
-    let seenEffortLabels = [];
     try {
       throwIfAborted();
       await openPicker();
       let allItems = allMenuItemsMerged();
-      items = allItems.filter((i) => !i.locked && !isJunkChromeLabel(i.label));
+      let items = allItems.filter((i) => !i.locked && !isJunkChromeLabel(i.label));
       if (!items.length) {
-        items = await waitForMenuItems(12);
+        items = await waitForMenuItems(debug ? 1 : 12);
       }
       const modelRows = items.filter((i) => isModelRowLabel(i.label));
       const lockedMatches = allItems.filter(
@@ -989,14 +903,18 @@
       const modelItem = pickModelRow(modelRows.length ? modelRows : items, model, wantEffort);
       if (!modelItem) {
         if (lockedMatches.length) {
-          throw new Error(
+          debugThrow(
+            debug,
             `model locked / requires unlock: ${model}. ` +
               `Available unlocked: ${formatAvailable(items)}. ` +
-              `Locked matches: ${formatAvailable(lockedMatches)}`
+              `Locked matches: ${formatAvailable(lockedMatches)}`,
+            "model_locked"
           );
         }
-        throw new Error(
-          `model not found: ${model}. Available from Gemini: ${formatAvailable(items)}`
+        debugThrow(
+          debug,
+          `model not found: ${model}. Available from Gemini: ${formatAvailable(items)}`,
+          "model_not_found"
         );
       }
       await H().humanClick(clickableMenuEl(modelItem.el));
@@ -1004,9 +922,11 @@
       await H().sleep(H().gaussianDelay(250, 60, 120, 450));
       if (findUnlockPopup()) {
         await dismissUnlockPopup();
-        throw new Error(
+        debugThrow(
+          debug,
           `model locked / unlock popup after select: ${modelItem.label}. ` +
-            `Available unlocked: ${formatAvailable(items.filter((i) => i !== modelItem))}`
+            `Available unlocked: ${formatAvailable(items.filter((i) => i !== modelItem))}`,
+          "model_unlock_popup"
         );
       }
 
@@ -1015,9 +935,11 @@
         await closePickerIfOpen();
         const label = readActiveModelLabel();
         if (!chipMatches(label, model)) {
-          throw new Error(
+          debugThrow(
+            debug,
             `model chip mismatch after select: requested=${model} chip=${label || "none"}. ` +
-              `Available unlocked: ${formatAvailable(items)}`
+              `Available unlocked: ${formatAvailable(items)}`,
+            "model_chip_mismatch"
           );
         }
         return { model: want, effort: wantEffort, label };
@@ -1025,8 +947,9 @@
 
       // After model click the overlay may still be settling — wait for stable effort rows
       // before clicking (do not click while overlay is closing). Never click Thinking header.
-      let effortMenu = await waitEffortRowsStable();
-      seenEffortLabels = discoverEffortLevelsSeen(allMenuItemsMerged()).labels;
+      const effortOpts = { debug };
+      let effortMenu = await waitEffortRowsStable(effortOpts);
+      let seenEffortLabels = discoverEffortLevelsSeen(allMenuItemsMerged()).labels;
       if (!seenEffortLabels.length) {
         seenEffortLabels = effortMenu.map((i) => i.label);
       }
@@ -1038,16 +961,20 @@
         await H().sleep(H().gaussianDelay(220, 50, 120, 400));
         if (findUnlockPopup()) {
           await dismissUnlockPopup();
-          throw new Error(
+          debugThrow(
+            debug,
             `effort locked / unlock popup after select: ${wantEffort}. ` +
-              formatEffortAvailability(seenEffortLabels, effortMenu)
+              formatEffortAvailability(seenEffortLabels, effortMenu),
+            "effort_unlock_popup"
           );
         }
       } else {
         // Honest error: never claim wantEffort without a click or embedded match.
-        throw new Error(
+        debugThrow(
+          debug,
           `effort not found: ${effort || wantEffort}. ` +
-            formatEffortAvailability(seenEffortLabels, effortMenu)
+            formatEffortAvailability(seenEffortLabels, effortMenu),
+          "effort_not_found"
         );
       }
 
@@ -1060,7 +987,7 @@
         try {
           await openPicker();
           await H().sleep(H().gaussianDelay(160, 40, 80, 280));
-          const rows = await waitEffortRowsStable();
+          const rows = await waitEffortRowsStable(effortOpts);
           const selected = rows.find(
             (i) =>
               matchWantEffort(i, wantEffort) &&
@@ -1085,16 +1012,20 @@
         }
       }
       if (!chipMatches(label, model)) {
-        throw new Error(
+        debugThrow(
+          debug,
           `model chip mismatch after select: requested=${model} chip=${label || "none"}. ` +
-            `Available unlocked: ${formatAvailable(items)}`
+            `Available unlocked: ${formatAvailable(items)}`,
+          "model_chip_mismatch"
         );
       }
       if (stuckEffort && stuckEffort !== wantEffort) {
-        throw new Error(
+        debugThrow(
+          debug,
           `effort click did not stick: requested=${wantEffort} chip_effort=${stuckEffort} ` +
             `chip=${label || "none"}. ` +
-            formatEffortAvailability(seenEffortLabels, effortMenu)
+            formatEffortAvailability(seenEffortLabels, effortMenu),
+          "effort_chip_mismatch"
         );
       }
       if (!stuckEffort) {
@@ -1108,27 +1039,57 @@
     }
   };
 
-  global.KBGeminiModels = {
-    isLocked,
-    isEffectivelyLocked,
-    findUnlockPopup,
-    findModelTrigger,
-    readActiveModelLabel,
-    listUnlockedModels,
-    selectModelAndEffort,
-    modelMatches,
-    chipMatches,
-    pickModelRow,
-    modelCoreTokens,
-    isModelRowLabel,
-    isEffortOnlyLabel,
-    isStrictEffortRow,
-    matchWantEffort,
-    effortPrimaryText,
-    modelsFromItems,
-    discoverEffortLevelsSeen,
-    clickableMenuEl,
-    isInteractiveControl,
-    captureRowHtml,
-  };
-})(globalThis);
+export {
+  isLocked,
+  isEffectivelyLocked,
+  findUnlockPopup,
+  findModelTrigger,
+  readActiveModelLabel,
+  failWithDebug,
+  buildDebugPayload,
+  capturePageDebugHtml,
+  listUnlockedModels,
+  selectModelAndEffort,
+  modelMatches,
+  chipMatches,
+  pickModelRow,
+  modelCoreTokens,
+  isModelRowLabel,
+  isEffortOnlyLabel,
+  isStrictEffortRow,
+  matchWantEffort,
+  effortPrimaryText,
+  modelsFromItems,
+  discoverEffortLevelsSeen,
+  clickableMenuEl,
+  isInteractiveControl,
+  captureRowHtml,
+  slugify,
+  tokenTailEq,
+  effortFromLabel,
+};
+
+/** KBGeminiModels-shaped API for callers that prefer one object. */
+export const createGeminiModels = () => ({
+  isLocked,
+  isEffectivelyLocked,
+  findUnlockPopup,
+  findModelTrigger,
+  readActiveModelLabel,
+  listUnlockedModels,
+  selectModelAndEffort,
+  modelMatches,
+  chipMatches,
+  pickModelRow,
+  modelCoreTokens,
+  isModelRowLabel,
+  isEffortOnlyLabel,
+  isStrictEffortRow,
+  matchWantEffort,
+  effortPrimaryText,
+  modelsFromItems,
+  discoverEffortLevelsSeen,
+  clickableMenuEl,
+  isInteractiveControl,
+  captureRowHtml,
+});

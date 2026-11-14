@@ -45,17 +45,53 @@ def _enqueue(client: httpx.Client, kind: CommandKind | str, params: dict[str, An
     return r.json()
 
 
-def _echo_json(obj: Any) -> None:
-    """Print one JSON line; ignore BrokenPipe (early tee/close)."""
+def _spill_debug_html_in_dict(d: dict[str, Any], command_id: str) -> dict[str, Any]:
+    """Write large debug_html to /tmp; keep metadata in JSON."""
+    if not isinstance(d, dict):
+        return d
+    html = d.get("debug_html")
+    if not isinstance(html, str) or not html:
+        return d
+    path = f"/tmp/kb-debug-{command_id}.html"
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(html)
+    out = dict(d)
+    del out["debug_html"]
+    out["debug_html_path"] = path
+    out["debug_html_chars"] = len(html)
+    return out
+
+
+def _apply_debug_spill(cmd: dict[str, Any]) -> dict[str, Any]:
+    """Deep-copy command blob; spill debug_html under result."""
+    command_id = str(cmd.get("id") or "unknown")
+    out = json.loads(json.dumps(cmd, ensure_ascii=False))
+    result = out.get("result")
+    if isinstance(result, dict):
+        out["result"] = _spill_debug_html_in_dict(result, command_id)
+    return out
+
+
+def _echo_json(obj: Any, *, command_id: str | None = None) -> None:
+    """Print one JSON line; spill debug_html from event payloads to /tmp."""
     try:
-        click.echo(json.dumps(obj, ensure_ascii=False))
+        to_print = obj
+        if (
+            command_id
+            and isinstance(obj, dict)
+            and isinstance(obj.get("payload"), dict)
+            and isinstance(obj["payload"].get("debug_html"), str)
+        ):
+            spilled = dict(obj)
+            spilled["payload"] = _spill_debug_html_in_dict(obj["payload"], command_id)
+            to_print = spilled
+        click.echo(json.dumps(to_print, ensure_ascii=False))
     except BrokenPipeError:
         return
     except OSError as e:
         if getattr(e, "errno", None) == 32:  # EPIPE
             return
         raise
-
 
 def _cancel(client: httpx.Client, command_id: str) -> None:
     try:
@@ -114,7 +150,7 @@ def _wait_stream(
                 for ev in r2.json().get("events") or []:
                     after = max(after, int(ev.get("seq") or 0))
                     if print_events:
-                        _echo_json(ev)
+                        _echo_json(ev, command_id=command_id)
             status = last.get("status")
             if status in TERMINAL:
                 return last
@@ -156,7 +192,11 @@ def browsers_cmd(ctx: click.Context) -> None:
 @click.option(
     "--model",
     default=None,
-    help="Exact unlocked picker label; optionally LABEL:effort (effort only if list-models shows it).",
+    help=(
+        "Unlocked picker label or short case-insensitive core "
+        "(e.g. argon, flash-lite); optionally MODEL:effort "
+        "(effort only if list-models shows it for that model)."
+    ),
 )
 @click.option("--timeout", "timeout_s", default=180, type=int, show_default=True)
 @click.option("--browser-id", default=None)
@@ -166,6 +206,12 @@ def browsers_cmd(ctx: click.Context) -> None:
     is_flag=True,
     default=False,
     help="Print one JSON object (terminal command blob) instead of NDJSON events.",
+)
+@click.option(
+    "--debug",
+    is_flag=True,
+    default=False,
+    help="Fail fast on DOM misses; attach live page HTML for agent inspection.",
 )
 @click.pass_context
 def query_cmd(
@@ -177,6 +223,7 @@ def query_cmd(
     browser_id: str | None,
     account: str | None,
     final_json: bool,
+    debug: bool,
 ) -> None:
     """Post a message in a Gemini thread and stream events until generation ends."""
     params: dict[str, Any] = {"text": text, "timeout_s": timeout_s}
@@ -190,13 +237,17 @@ def query_cmd(
         params["browser_id"] = browser_id
     if account:
         params["account"] = account
+    if debug:
+        params["debug"] = True
 
     with _client(ctx.obj["url"]) as client:
         cmd = _enqueue(client, CommandKind.QUERY, params)
         result = _wait_stream(client, cmd["id"], print_events=not final_json)
-    if final_json:
-        click.echo(json.dumps(result, indent=2, ensure_ascii=False))
+    result = _apply_debug_spill(result)
     status = result.get("status")
+    # Always print terminal blob for --final-json, or on --debug failure (path to HTML).
+    if final_json or (debug and status in _FAIL_STATUSES):
+        click.echo(json.dumps(result, indent=2, ensure_ascii=False))
     if status in _FAIL_STATUSES:
         raise SystemExit(1)
     # Surface model auto-switch clearly on stderr summary
@@ -217,6 +268,12 @@ def query_cmd(
 @click.option("--browser-id", default=None)
 @click.option("--account", default=None)
 @click.option("--timeout", "timeout_s", default=60, type=int, show_default=True)
+@click.option(
+    "--debug",
+    is_flag=True,
+    default=False,
+    help="Single scrape attempt; attach page HTML when model picker misses.",
+)
 @click.pass_context
 def list_models_cmd(
     ctx: click.Context,
@@ -224,6 +281,7 @@ def list_models_cmd(
     browser_id: str | None,
     account: str | None,
     timeout_s: int,
+    debug: bool,
 ) -> None:
     """List unlocked Gemini models/efforts from the live picker."""
     params: dict[str, Any] = {"timeout_s": timeout_s}
@@ -233,10 +291,13 @@ def list_models_cmd(
         params["browser_id"] = browser_id
     if account:
         params["account"] = account
+    if debug:
+        params["debug"] = True
 
     with _client(ctx.obj["url"]) as client:
         cmd = _enqueue(client, CommandKind.LIST_MODELS, params)
         result = _wait_stream(client, cmd["id"], print_events=False)
+    result = _apply_debug_spill(result)
     if result.get("status") in _FAIL_STATUSES:
         click.echo(json.dumps(result, indent=2, ensure_ascii=False), err=True)
         raise SystemExit(1)

@@ -2,12 +2,7 @@
  * Gemini page content script: extract full thread via hNvQHb → structured turns.
  * No markdown formatting — server owns format/fingerprint.
  */
-
-// Bumped with manifest; background reloads the tab when this mismatches.
-const EXT_BUILD =
-  (typeof chrome !== "undefined" && chrome.runtime?.getManifest?.()?.version) || "0.3.18";
-
-const {
+import {
   CommandKind,
   EventType,
   Effort,
@@ -16,12 +11,19 @@ const {
   SearchSource,
   TrustedAction,
   gaussMs,
-} = globalThis.KB;
+} from "../shared/constants.js";
+import * as H from "../human/index.js";
+import * as Models from "../models/index.js";
+
+// Bumped with manifest; background reloads the tab when this mismatches.
+const EXT_BUILD =
+  (typeof chrome !== "undefined" && chrome.runtime?.getManifest?.()?.version) || "0.3.18";
+const CONTENT_HASH =
+  (typeof globalThis !== "undefined" && globalThis.__KB_BUILD_META__?.contentHash) || "";
 
 const PAGE_SIZE = 10;
 const MAX_RPC_PAGES = 8;
 const gSleep = (mean, sigma, min, max) => {
-  const H = globalThis.KBHuman;
   const ms = gaussMs(mean, sigma, min, max);
   if (H?.sleep) return H.sleep(ms);
   return new Promise((r) => setTimeout(r, ms));
@@ -34,7 +36,6 @@ let batchexecuteReqId = 100000 + Math.floor(Math.random() * 9000);
 let lastScheduledCid = null;
 /** Best-effort abort for in-flight remoteQuery / listUnlockedModels. */
 let remoteAborted = false;
-let remoteAbortCommandId = null;
 
 const throwIfRemoteAborted = () => {
   if (!remoteAborted) return;
@@ -496,7 +497,6 @@ const parseBatchexecute = (text) => {
 };
 
 const fetchPage = async (conversationId, cursor, runtime) => {
-  const H = globalThis.KBHuman;
   const cId = conversationId.startsWith("c_") ? conversationId : `c_${conversationId}`;
   const args = [cId, PAGE_SIZE, cursor, 1, [1], [4], null, 1];
   const inner = JSON.stringify(args);
@@ -649,6 +649,13 @@ const findComposer = () => {
   return null;
 };
 
+const sendButtonEnabled = (el) => {
+  if (!el) return false;
+  if (el.disabled) return false;
+  if (el.getAttribute("aria-disabled") === "true") return false;
+  return true;
+};
+
 const findSendButton = () => {
   const sels = [
     'button[aria-label*="Send" i]',
@@ -657,12 +664,12 @@ const findSendButton = () => {
   ];
   for (const s of sels) {
     const el = document.querySelector(s);
-    if (el && !el.disabled) return el;
+    if (sendButtonEnabled(el)) return el;
   }
   // mat-icon send near composer
   for (const b of document.querySelectorAll("button")) {
     const t = (b.getAttribute("aria-label") || b.textContent || "").toLowerCase();
-    if (/send|submit/.test(t) && !b.disabled) return b;
+    if (/send|submit/.test(t) && sendButtonEnabled(b)) return b;
   }
   return null;
 };
@@ -707,8 +714,7 @@ const latestModelResponseEl = () => {
 
 const readLastReplyHuman = async ({ reason } = {}) => {
   try {
-    const H = globalThis.KBHuman;
-    if (typeof H?.humanScroll !== "function") return;
+      if (typeof H?.humanScroll !== "function") return;
     const el = latestModelResponseEl();
     if (!el) return;
     const vh = window.innerHeight;
@@ -781,7 +787,6 @@ const scrapeDomTurns = () => {
 };
 
 const waitForGenerationEnd = async (timeoutMs, onProgress) => {
-  const H = globalThis.KBHuman;
   const start = Date.now();
   // Idle budget: no DOM/generation progress for this long → stop waiting.
   // Hard cap: absolute ceiling even while streaming (keeps runaway chats bounded).
@@ -840,7 +845,6 @@ const waitForGenerationEnd = async (timeoutMs, onProgress) => {
       if (lastLen >= 0 && Math.abs(bodyLen - lastLen) < 40) stable += 1;
       else stable = 0;
       if (stable >= 4 && elapsed >= minWaitMs) {
-        lastLen = bodyLen;
         await gSleep(1600, 350, 900, 2800); // let batchexecute index the new turn
         return { sawGen, elapsed_ms: Date.now() - start };
       }
@@ -913,7 +917,6 @@ const extractTurnsWithRetry = async (
   conversationId,
   { minTurns = 1, timeoutMs = 40000, promptText = null, preferDom = false } = {}
 ) => {
-  const H = globalThis.KBHuman;
   const start = Date.now();
   let last = { turns: [], complete: false };
   let attempt = 0;
@@ -971,7 +974,6 @@ const assertOnConversation = (wantId) => {
 };
 
 const scrapeConversations = ({ query, limit, offset }) => {
-  const H = globalThis.KBHuman;
   const q = (query || "").toLowerCase();
   const links = [...document.querySelectorAll('a[href*="/app/"]')];
   const seen = new Set();
@@ -991,7 +993,6 @@ const scrapeConversations = ({ query, limit, offset }) => {
 };
 
 const remoteSearchConversations = async (params) => {
-  const H = globalThis.KBHuman;
   // Wheel-scroll the sidebar (not scrollTop+=) so it looks like real input.
   for (let i = 0; i < 5; i++) {
     await H.humanScroll(H.rand(280, 420));
@@ -1038,7 +1039,7 @@ const remoteSearchMessages = async (params) => {
 
 const remoteListModels = async (params = {}, emit) => {
   throwIfRemoteAborted();
-  const listed = await globalThis.KBGeminiModels.listUnlockedModels(params || {}, emit);
+  const listed = await Models.listUnlockedModels(params || {}, emit);
   throwIfRemoteAborted();
   // Newer scrapers return { models, locked, debug, thinking_levels }; keep array return compatible.
   const models = Array.isArray(listed) ? listed : listed?.models || [];
@@ -1060,8 +1061,8 @@ const remoteListModels = async (params = {}, emit) => {
 const remotePageHtml = (params = {}) => {
   const maxChars = Math.max(1000, Math.min(5_000_000, Number(params.max_chars) || 200_000));
   const selector = (params.selector || "").trim() || null;
-  let html = "";
   let matchCount = null;
+  let html;
   if (selector) {
     const nodes = [...document.querySelectorAll(selector)];
     matchCount = nodes.length;
@@ -1087,8 +1088,6 @@ const remotePageHtml = (params = {}) => {
 };
 
 const remoteQuery = async (params, emit) => {
-  const H = globalThis.KBHuman;
-  const Models = globalThis.KBGeminiModels;
   const text = params.text || "";
   if (!text) throw new Error("query text required");
   throwIfRemoteAborted();
@@ -1105,7 +1104,8 @@ const remoteQuery = async (params, emit) => {
     throwIfRemoteAborted();
     const sel = await Models.selectModelAndEffort(
       modelRequested,
-      effortRequested || Effort.MEDIUM
+      effortRequested || Effort.MEDIUM,
+      { debug: !!params.debug }
     );
     await emit(EventType.MODEL_SELECTED, sel);
     modelActualLabel = sel.label || Models.readActiveModelLabel();
@@ -1113,7 +1113,12 @@ const remoteQuery = async (params, emit) => {
 
   throwIfRemoteAborted();
   const composer = findComposer();
-  if (!composer) throw new Error("composer not found");
+  if (!composer) {
+    if (params.debug && typeof Models.failWithDebug === "function") {
+      throw Models.failWithDebug("composer not found", "composer_not_found");
+    }
+    throw new Error("composer not found");
+  }
   // Brief settle / pointer wander before first keystroke after navigation.
   await H.sleep(H.gaussianDelay(1800, 400, 1200, 3200));
   throwIfRemoteAborted();
@@ -1126,19 +1131,81 @@ const remoteQuery = async (params, emit) => {
   // Keepalive while CDP compose can run long without generation deltas.
   await emit(EventType.DELTA, { composing: true, response_len: 0 });
   throwIfRemoteAborted();
-  await H.humanType(composer, text);
+  try {
+    await H.humanType(composer, text);
+  } catch (err) {
+    if (err?.cancelled || err?.aborted) throw err;
+    if (params.debug && typeof Models.failWithDebug === "function") {
+      throw Models.failWithDebug(
+        String(err?.message ?? err),
+        err?.composeFailed ? "compose_failed" : "compose_error"
+      );
+    }
+    throw err;
+  }
   throwIfRemoteAborted();
   await emit(EventType.DELTA, { composing: true, response_len: 0 });
   if (typeof H.composerHasPrompt === "function" && !H.composerHasPrompt(composer, text)) {
-    throw new Error("composer does not contain full prompt; refusing to send");
+    const msg = "composer does not contain full prompt; refusing to send";
+    if (params.debug && typeof Models.failWithDebug === "function") {
+      throw Models.failWithDebug(msg, "compose_failed");
+    }
+    throw new Error(msg);
   }
   await H.betweenActions();
   throwIfRemoteAborted();
-  const send = findSendButton();
-  if (!send) {
-    await H.humanKey(composer, "Enter");
-  } else {
-    await H.humanClick(send);
+
+  const userQueryCount = () => document.querySelectorAll("user-query").length;
+  const snapBefore = {
+    responseLen: responseTextLen(),
+    userQueries: userQueryCount(),
+    generating: isGenerating(),
+  };
+  const submitStarted = () => {
+    if (!snapBefore.generating && isGenerating()) return true;
+    if (responseTextLen() > snapBefore.responseLen) return true;
+    if (userQueryCount() > snapBefore.userQueries) return true;
+    if (
+      typeof H.composerHasPrompt === "function" &&
+      !H.composerHasPrompt(composer, text)
+    ) {
+      return true;
+    }
+    return false;
+  };
+  const pollSubmitStart = async (deadlineMs) => {
+    const t0 = Date.now();
+    while (Date.now() - t0 < deadlineMs) {
+      throwIfRemoteAborted();
+      if (submitStarted()) return true;
+      await gSleep(280, 70, 140, 480);
+    }
+    return submitStarted();
+  };
+
+  // Enter first (CDP via always-KEY). Do not wait on Send before Enter.
+  await H.humanKey(composer, "Enter", { requireCdp: true });
+  let started = await pollSubmitStart(gaussMs(2800, 400, 2000, 3500));
+
+  // One forced CDP Send click if Enter did not start and prompt still sits.
+  if (
+    !started &&
+    typeof H.composerHasPrompt === "function" &&
+    H.composerHasPrompt(composer, text)
+  ) {
+    const send = findSendButton();
+    if (send) {
+      await H.humanClick(send, { forceCdp: true });
+      started = await pollSubmitStart(gaussMs(2800, 400, 2000, 3500));
+    }
+  }
+
+  if (!started) {
+    const msg = "submit not accepted";
+    if (params.debug && typeof Models.failWithDebug === "function") {
+      throw Models.failWithDebug(msg, "submit_failed");
+    }
+    throw new Error(msg);
   }
 
   // Conversation id often appears shortly after submit on /app → /app/<id>.
@@ -1258,108 +1325,116 @@ const remoteQuery = async (params, emit) => {
   };
 };
 
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-  if (!msg || !msg.type) return false;
+if (!globalThis.__KB_CONTENT_BOOTED) {
+  globalThis.__KB_CONTENT_BOOTED = true;
 
-  switch (msg.type) {
-    case MsgType.PUSH_NOW:
-      runExtractAndSend({ force: true }).then(() => sendResponse({ ok: true }));
-      return true;
+  chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+    if (!msg || !msg.type) return false;
 
-    case MsgType.PING:
-      sendResponse({
-        ok: true,
-        build: EXT_BUILD,
-        conversation_id: conversationIdFromUrl(),
-        account: detectAccount(),
-        title: pageTitle(),
-      });
-      return true;
+    switch (msg.type) {
+      case MsgType.PUSH_NOW:
+        runExtractAndSend({ force: true }).then(() => sendResponse({ ok: true }));
+        return true;
 
-    case MsgType.REMOTE_CANCEL: {
-      remoteAborted = true;
-      remoteAbortCommandId = msg.commandId || null;
-      sendResponse({ ok: true, aborted: true });
-      return true;
-    }
+      case MsgType.PING:
+        sendResponse({
+          ok: true,
+          build: EXT_BUILD,
+          contentHash: CONTENT_HASH,
+          conversation_id: conversationIdFromUrl(),
+          account: detectAccount(),
+          title: pageTitle(),
+        });
+        return true;
 
-    case MsgType.REMOTE: {
-      const { commandId, kind, params } = msg;
-      remoteAborted = false;
-      remoteAbortCommandId = commandId || null;
-      (async () => {
-        const emit = async (type, payload) => {
-          if (remoteAborted) return;
-          chrome.runtime.sendMessage({
-            type: MsgType.REMOTE_EVENT,
-            commandId,
-            eventType: type,
-            payload: payload || {},
-          });
-        };
-        try {
-          let result;
-          switch (kind) {
-            case CommandKind.LIST_MODELS:
-              result = await remoteListModels(params || {}, emit);
-              break;
-            case CommandKind.PAGE_HTML:
-              result = remotePageHtml(params || {});
-              break;
-            case CommandKind.SEARCH:
-              result = params.conversation_id
-                ? await remoteSearchMessages(params)
-                : await remoteSearchConversations(params);
-              break;
-            case CommandKind.QUERY:
-              result = await remoteQuery(params || {}, emit);
-              break;
-            default:
-              sendResponse({ ok: false, error: `unknown kind ${kind}` });
+      case MsgType.REMOTE_CANCEL: {
+        remoteAborted = true;
+        sendResponse({ ok: true, aborted: true });
+        return true;
+      }
+
+      case MsgType.REMOTE: {
+        const { commandId, kind, params } = msg;
+        remoteAborted = false;
+        (async () => {
+          const emit = async (type, payload) => {
+            if (remoteAborted) return;
+            chrome.runtime.sendMessage({
+              type: MsgType.REMOTE_EVENT,
+              commandId,
+              eventType: type,
+              payload: payload || {},
+            });
+          };
+          try {
+            let result;
+            switch (kind) {
+              case CommandKind.LIST_MODELS:
+                result = await remoteListModels(params || {}, emit);
+                break;
+              case CommandKind.PAGE_HTML:
+                result = remotePageHtml(params || {});
+                break;
+              case CommandKind.SEARCH:
+                result = params.conversation_id
+                  ? await remoteSearchMessages(params)
+                  : await remoteSearchConversations(params);
+                break;
+              case CommandKind.QUERY:
+                result = await remoteQuery(params || {}, emit);
+                break;
+              default:
+                sendResponse({ ok: false, error: `unknown kind ${kind}` });
+                return;
+            }
+            if (remoteAborted) {
+              sendResponse({
+                ok: false,
+                error: "command cancelled",
+                cancelled: true,
+              });
               return;
-          }
-          if (remoteAborted) {
+            }
+            sendResponse({ ok: true, result });
+          } catch (err) {
             sendResponse({
               ok: false,
-              error: "command cancelled",
-              cancelled: true,
+              error: String(err?.message ?? err),
+              captcha: !!err?.captcha,
+              cancelled: !!err?.cancelled,
+              debug_html: err?.debug_html,
+              debug_reason: err?.debug_reason,
+              debug_html_length: err?.debug_html_length,
+              debug_url: err?.debug_url,
+              debug_title: err?.debug_title,
+              debug_menu: err?.debug_menu,
             });
-            return;
+          } finally {
+            remoteAborted = false;
           }
-          sendResponse({ ok: true, result });
-        } catch (err) {
-          sendResponse({
-            ok: false,
-            error: String(err?.message ?? err),
-            captcha: !!err?.captcha,
-            cancelled: !!err?.cancelled,
-          });
-        } finally {
-          remoteAborted = false;
-          remoteAbortCommandId = null;
-        }
-      })();
-      return true;
+        })();
+        return true;
+      }
+
+      default:
+        return false;
     }
+  });
 
-    default:
-      return false;
-  }
-});
+  // Soft URL poll instead of wrapping history.pushState (less fingerprintable).
+  const pollUrlChange = () => {
+    const id = conversationIdFromUrl();
+    if (id && id !== lastScheduledCid) {
+      lastScheduledCid = id;
+      scheduleExtract();
+    }
+    setTimeout(pollUrlChange, gaussMs(5200, 1100, 2800, 9000));
+  };
+  setTimeout(pollUrlChange, gaussMs(2800, 700, 1200, 5000));
+  window.addEventListener("popstate", scheduleExtract);
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") scheduleExtract();
+  });
 
-// Soft URL poll instead of wrapping history.pushState (less fingerprintable).
-const pollUrlChange = () => {
-  const id = conversationIdFromUrl();
-  if (id && id !== lastScheduledCid) {
-    lastScheduledCid = id;
-    scheduleExtract();
-  }
-  setTimeout(pollUrlChange, gaussMs(5200, 1100, 2800, 9000));
-};
-setTimeout(pollUrlChange, gaussMs(2800, 700, 1200, 5000));
-window.addEventListener("popstate", scheduleExtract);
-document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "visible") scheduleExtract();
-});
-
-scheduleExtract();
+  scheduleExtract();
+}

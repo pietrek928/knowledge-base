@@ -94,10 +94,17 @@ Document embeds run **one model at a time**. If Takeout hits `ReadTimeout`, rais
 
 ### Extension (Chrome / Brave)
 
-Load unpacked from [`extension/gemini-kb/`](extension/gemini-kb/) (v0.3.1+):
+Load unpacked from [`extension/gemini-kb/dist/`](extension/gemini-kb/dist/) (v0.3.18+; ESM sources → Rollup IIFE):
+
+```bash
+cd extension/gemini-kb
+npm ci
+npm run build          # production bundles → dist/
+# npm run dev          # watch + WebSocket chrome.runtime.reload() on :9333
+```
 
 1. Start the KB: `uv run kb serve --host 127.0.0.1 --port 8080`
-2. Chrome `chrome://extensions` or Brave `brave://extensions` → Developer mode → **Load unpacked** → select `extension/gemini-kb` (reload after updates)
+2. Chrome `chrome://extensions` or Brave `brave://extensions` → Developer mode → **Load unpacked** → select `extension/gemini-kb/dist` (use `npm run build` or `npm run dev` after source edits)
 3. Open the popup: set KB URL (`http://127.0.0.1:8080`), enable **Auto-save while browsing**
 4. Visit `https://gemini.google.com/app/<id>` — the extension paginates private `hNvQHb` RPC and `POST`s structured turns to `/ingest/gemini` (no public share links)
 5. Weekly alarm re-syncs chats that were never pushed, marked `pendingFullSync`, or last pushed &gt; 7 days ago

@@ -11,3 +11,9 @@ build/
 *.npz
 .kb/
 .ruff_cache/
+node_modules/
+**/node_modules/
+extension/gemini-kb/dist/
+extension/gemini-kb/.rollup.cache/
+*.tsbuildinfo
+.rollup.cache/

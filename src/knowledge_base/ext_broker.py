@@ -39,15 +39,21 @@ def clamp_timeout(v: Any, default: int = DEFAULT_QUERY_TIMEOUT_S) -> int:
 
 
 def parse_model_spec(spec: str | None) -> tuple[str | None, str | None]:
-    """Parse `model` or `model:effort` (default effort medium when model set)."""
+    """Parse `model` or `model:effort` (default effort medium when model set).
+
+    Model may be a full picker label or a short case-insensitive core
+    (e.g. ``argon``, ``flash-lite``) that chip-matches via token-tail equality.
+    Effort is always lowercased (``High`` → ``high``).
+    """
     if not spec or not str(spec).strip():
         return None, None
     raw = str(spec).strip()
     if ":" in raw:
         model, effort = raw.rsplit(":", 1)
-        model, effort = model.strip(), effort.strip() or Effort.MEDIUM
-        return model or None, effort
-    return raw, Effort.MEDIUM
+        model = model.strip() or None
+        effort_raw = (effort.strip() or str(Effort.MEDIUM)).lower()
+        return model, effort_raw
+    return raw, str(Effort.MEDIUM).lower()
 
 
 @dataclass

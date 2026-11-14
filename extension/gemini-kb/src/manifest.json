@@ -33,7 +33,7 @@
         "https://gemini.google.com/app/",
         "https://gemini.google.com/app/*"
       ],
-      "js": ["constants.js", "human.js", "gemini_models.js", "content.js"],
+      "js": ["build-meta.js", "content.js"],
       "run_at": "document_idle"
     }
   ]

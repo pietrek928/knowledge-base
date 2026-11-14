@@ -2,10 +2,7 @@
  * Background: ingest POSTs, chrome.storage tracking, weekly sweep,
  * remote-command poll loop against the knowledge-base server.
  */
-
-importScripts("constants.js");
-
-const {
+import {
   CommandKind,
   CAPABILITIES,
   TrustedAction,
@@ -13,7 +10,9 @@ const {
   CommandStatus,
   MsgType,
   gaussMs,
-} = globalThis.KB;
+} from "../shared/constants.js";
+
+const CONTENT_FILES = ["build-meta.js", "content.js"];
 
 const DEFAULTS = {
   kbUrl: "http://127.0.0.1:8080",
@@ -41,6 +40,9 @@ let commandBusy = false;
 let lastBusyHeartbeatAt = 0;
 let backoffUntil = 0;
 let lastRegisterOk = null;
+/** Set by cancel/timeout so in-flight CDP loops stop; cleared when a command starts. */
+let cdpAbort = false;
+const CDP_CMD_TIMEOUT_MS = 5000;
 
 const log = (...args) => {
   console.log("[gemini-kb]", ...args);
@@ -136,12 +138,40 @@ const debuggerDetach = async (tabId) => {
   debuggerSessions.delete(tabId);
 };
 
+const assertCdpNotAborted = () => {
+  if (!cdpAbort) return;
+  throw Object.assign(new Error("cdp aborted"), { aborted: true });
+};
+
 const dbg = async (tabId, method, params) => {
-  return chrome.debugger.sendCommand({ tabId }, method, params);
+  assertCdpNotAborted();
+  let timer = null;
+  try {
+    return await Promise.race([
+      chrome.debugger.sendCommand({ tabId }, method, params),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          reject(Object.assign(new Error(`cdp timeout: ${method}`), { cdpTimeout: true }));
+        }, CDP_CMD_TIMEOUT_MS);
+      }),
+    ]);
+  } catch (err) {
+    if (err?.cdpTimeout || err?.aborted) {
+      try {
+        await debuggerDetach(tabId);
+      } catch {
+        /* ignore */
+      }
+    }
+    throw err;
+  } finally {
+    if (timer != null) clearTimeout(timer);
+  }
 };
 
 const trustedMovePath = async (tabId, path) => {
   for (const p of path || []) {
+    assertCdpNotAborted();
     await dbg(tabId, "Input.dispatchMouseEvent", {
       type: "mouseMoved",
       x: p.x,
@@ -153,9 +183,11 @@ const trustedMovePath = async (tabId, path) => {
 };
 
 const trustedClick = async (tabId, { path, x, y }) => {
+  assertCdpNotAborted();
   if (!(await debuggerAttach(tabId))) return false;
   if (path?.length) await trustedMovePath(tabId, path);
   await sleep(gaussian(50, 15, 30, 80));
+  assertCdpNotAborted();
   await dbg(tabId, "Input.dispatchMouseEvent", {
     type: "mousePressed",
     x,
@@ -164,6 +196,7 @@ const trustedClick = async (tabId, { path, x, y }) => {
     clickCount: 1,
   });
   await sleep(gaussian(70, 20, 40, 120));
+  assertCdpNotAborted();
   await dbg(tabId, "Input.dispatchMouseEvent", {
     type: "mouseReleased",
     x,
@@ -175,9 +208,11 @@ const trustedClick = async (tabId, { path, x, y }) => {
 };
 
 const trustedType = async (tabId, { text, delays }) => {
+  assertCdpNotAborted();
   if (!(await debuggerAttach(tabId))) return false;
   const chars = Array.from(String(text || ""));
   for (let i = 0; i < chars.length; i++) {
+    assertCdpNotAborted();
     const ch = chars[i];
     const delay = (delays && delays[i]) || Math.round(gaussian(75, 25, 40, 140));
     if (ch === "\n" || ch === "\r") {
@@ -190,6 +225,7 @@ const trustedType = async (tabId, { text, delays }) => {
         unmodifiedText: ch,
       });
       await sleep(gaussian(40, 12, 25, 80));
+      assertCdpNotAborted();
       await dbg(tabId, "Input.dispatchKeyEvent", {
         type: "keyUp",
         text: ch,
@@ -203,6 +239,7 @@ const trustedType = async (tabId, { text, delays }) => {
 
 /** Bulk insert (paste-like) via CDP — no per-key delays. */
 const trustedPaste = async (tabId, { text }) => {
+  assertCdpNotAborted();
   if (!(await debuggerAttach(tabId))) return false;
   const chunk = String(text || "");
   if (!chunk) return true;
@@ -211,6 +248,7 @@ const trustedPaste = async (tabId, { text }) => {
 };
 
 const trustedKey = async (tabId, meta) => {
+  assertCdpNotAborted();
   if (!(await debuggerAttach(tabId))) return false;
   const key = meta.key || "Enter";
   const code = meta.code || key;
@@ -224,6 +262,7 @@ const trustedKey = async (tabId, meta) => {
     text: meta.text || (key === "Enter" ? "\r" : undefined),
   });
   await sleep(gaussian(50, 15, 30, 90));
+  assertCdpNotAborted();
   await dbg(tabId, "Input.dispatchKeyEvent", {
     type: "keyUp",
     key,
@@ -235,10 +274,12 @@ const trustedKey = async (tabId, meta) => {
 };
 
 const trustedWheel = async (tabId, { deltaY, x, y, steps }) => {
+  assertCdpNotAborted();
   if (!(await debuggerAttach(tabId))) return false;
   const n = Math.max(1, steps || 6);
   const step = (deltaY || 0) / n;
   for (let i = 0; i < n; i++) {
+    assertCdpNotAborted();
     await dbg(tabId, "Input.dispatchMouseEvent", {
       type: "mouseWheel",
       x: x || 400,
@@ -257,12 +298,17 @@ const handleTrustedInput = async (tabId, msg) => {
     await debuggerDetach(tabId);
     return { ok: true };
   }
+  if (cdpAbort) return { ok: false, aborted: true };
   const state = await getState();
-  // TYPE/PASTE always use CDP: document.execCommand is deprecated and Range+synthetic
-  // InputEvent does not stick in Gemini's Angular contenteditable. The popup
-  // "trustedInput" flag still gates click/move/wheel (debugger banner for those).
+  // TYPE/PASTE/KEY always use CDP: synthetic InputEvent does not stick in
+  // Gemini's Angular contenteditable, and submit Enter must be trusted.
+  // forceCdp: one-shot Send-button click after a missed Enter (not global click).
+  // trustedInput still gates MOVE/WHEEL and normal CLICK (debugger banner).
   const alwaysCdp =
-    msg.action === TrustedAction.TYPE || msg.action === TrustedAction.PASTE;
+    msg.action === TrustedAction.TYPE ||
+    msg.action === TrustedAction.PASTE ||
+    msg.action === TrustedAction.KEY ||
+    (msg.forceCdp === true && msg.action === TrustedAction.CLICK);
   if (!state.trustedInput && !alwaysCdp) {
     return { ok: false, skipped: true, reason: "trustedInput disabled" };
   }
@@ -286,6 +332,11 @@ const handleTrustedInput = async (tabId, msg) => {
         return { ok: false, error: `unknown action ${msg.action}` };
     }
   } catch (err) {
+    if (err?.aborted) return { ok: false, aborted: true };
+    if (err?.cdpTimeout) {
+      logWarn("trusted input CDP timeout", String(err?.message ?? err));
+      return { ok: false, error: String(err?.message ?? err), cdpTimeout: true };
+    }
     logWarn("trusted input failed", String(err?.message ?? err));
     return { ok: false, error: String(err?.message ?? err) };
   }
@@ -583,20 +634,39 @@ const injectContentScripts = async (tabId) => {
   // Needed after extension reload: existing Gemini tabs keep the old page without CS.
   await chrome.scripting.executeScript({
     target: { tabId },
-    files: ["constants.js", "human.js", "gemini_models.js", "content.js"],
+    files: CONTENT_FILES,
   });
 };
 
-const refreshPickerHelpers = async (tabId) => {
-  // Re-assign KBGeminiModels from disk without duplicating content.js listeners.
-  await chrome.scripting.executeScript({
-    target: { tabId },
-    files: ["constants.js", "human.js", "gemini_models.js"],
-  });
+const wantContentHash = () => {
+  try {
+    // build-meta.js is not imported into the SW; read from generated global if present,
+    // else from the extension URL fetch of build-meta.json (sync via last known).
+    return globalThis.__KB_BUILD_META__?.contentHash || _cachedContentHash || "";
+  } catch {
+    return _cachedContentHash || "";
+  }
 };
+
+let _cachedContentHash = "";
+const refreshContentHashCache = async () => {
+  try {
+    const url = chrome.runtime.getURL("build-meta.json");
+    const res = await fetch(url);
+    if (!res.ok) return;
+    const meta = await res.json();
+    _cachedContentHash = meta.contentHash || "";
+    globalThis.__KB_BUILD_META__ = meta;
+  } catch {
+    /* ignore */
+  }
+};
+refreshContentHashCache();
 
 const waitTabReady = async (tabId, timeoutMs = 25000) => {
   const wantBuild = chrome.runtime.getManifest().version;
+  await refreshContentHashCache();
+  const wantHash = wantContentHash();
   const start = Date.now();
   let injected = false;
   let reloaded = false;
@@ -606,8 +676,16 @@ const waitTabReady = async (tabId, timeoutMs = 25000) => {
       const ping = await chrome.tabs.sendMessage(tabId, { type: MsgType.PING });
       if (ping && ping.ok) {
         // Unpacked updates leave old content scripts until navigation/reload.
-        if (ping.build && ping.build !== wantBuild && !buildReloaded) {
-          log("content build mismatch", ping.build, "→", wantBuild, "reloading tab", tabId);
+        const buildMismatch = ping.build && ping.build !== wantBuild;
+        const hashMismatch =
+          wantHash && ping.contentHash && ping.contentHash !== wantHash;
+        if ((buildMismatch || hashMismatch) && !buildReloaded) {
+          log(
+            "content build/hash mismatch",
+            { build: ping.build, wantBuild, hash: ping.contentHash, wantHash },
+            "reloading tab",
+            tabId
+          );
           buildReloaded = true;
           reloaded = true;
           await chrome.tabs.reload(tabId);
@@ -649,6 +727,24 @@ const waitTabReady = async (tabId, timeoutMs = 25000) => {
   throw new Error("content script not ready");
 };
 
+const DEBUG_RESPONSE_KEYS = [
+  "debug_html",
+  "debug_reason",
+  "debug_html_length",
+  "debug_url",
+  "debug_title",
+  "debug_menu",
+];
+
+const pickDebugFields = (src) => {
+  if (!src || typeof src !== "object") return {};
+  const out = {};
+  for (const k of DEBUG_RESPONSE_KEYS) {
+    if (src[k] !== undefined) out[k] = src[k];
+  }
+  return out;
+};
+
 const runRemoteCommand = async (cmd) => {
   const kind = cmd.kind;
   const params = cmd.params || {};
@@ -678,14 +774,14 @@ const runRemoteCommand = async (cmd) => {
     await sleepGauss(800, 250, 400, 1600);
   }
 
-  let created = false;
   let tab = null;
+  cdpAbort = false;
   try {
     await postEvent(commandId, EventType.RUNNING, { kind });
     const forNew = kind === CommandKind.QUERY && !params.conversation_id;
     const opened = await findOrCreateTab(params.conversation_id || null, { forNew });
     tab = opened.tab;
-    created = opened.created;
+    const created = opened.created;
     // chrome.tabs.create can return before url is set; wait for a real gemini /app URL.
     const isGeminiApp = (u) => /gemini\.google\.com\/app/i.test(u || "");
     if (!isGeminiApp(tab.url)) {
@@ -723,13 +819,6 @@ const runRemoteCommand = async (cmd) => {
       }
     }
 
-    // Unpacked updates: refresh picker helpers from disk (no listener duplication).
-    try {
-      await refreshPickerHelpers(tab.id);
-    } catch (err) {
-      logWarn("refreshPickerHelpers failed", String(err?.message ?? err));
-    }
-
     // Idle timeout extends only on real progress; hardDeadline is the safety net.
     const timeoutMs = Math.max(15, Math.min(600, Number(cmd.timeout_s) || Number(params.timeout_s) || 180)) * 1000;
     const hardMs = Math.min(600_000, Math.max(timeoutMs * 3, timeoutMs + 120_000));
@@ -748,6 +837,12 @@ const runRemoteCommand = async (cmd) => {
 
     const signalContentCancel = async (reason) => {
       aborted = true;
+      cdpAbort = true;
+      try {
+        await debuggerDetach(tab.id);
+      } catch {
+        /* ignore */
+      }
       try {
         await chrome.tabs.sendMessage(tab.id, {
           type: MsgType.REMOTE_CANCEL,
@@ -873,6 +968,7 @@ const runRemoteCommand = async (cmd) => {
       }
       await postEvent(commandId, EventType.ERROR, {
         error: (response && response.error) || "command failed",
+        ...pickDebugFields(response),
       });
       return;
     }

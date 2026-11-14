@@ -20,11 +20,11 @@ When smoke-testing `kb-cli` / the Gemini extension (`query`, chip match, keepali
 2. Today that is usually **`Quick answers 3.5 Flash-Lite`** (not Pro, Argon, or locked Carbon).
 3. Keep prompts tiny (one-word reply) with a **new nonce** each run. Re-run `list-models` if the label set changes; never hard-code a locked SKU.
 4. Only use a heavier model when the test specifically needs that SKU (e.g. Argon chip-suffix regression).
-5. Do not enqueue while `browsers[].busy`; abort in-flight work with SIGINT only.
+5. Do not enqueue while `browsers[].busy`; abort in-flight work with SIGINT or SIGTERM. SIGKILL leaves `busy` set.
 
 ```bash
 uv run kb-cli browsers   # one server; every browsers[].busy must be false
-uv run kb-cli list-models
+uv run kb-cli list-models --timeout 180
 uv run kb-cli query "Reply with exactly one word: pong. nonce:$RANDOM" \
   --model 'Quick answers 3.5 Flash-Lite' --timeout 180 --final-json
 ```
@@ -51,4 +51,4 @@ PY
 gauss_sleep 2 0.7 0.5 4
 ```
 
-Extension + CLI use the same rule: shared `KB.gaussMs` / `sleepGauss` / `_gauss_sleep` — no flat `sleep(N)` / `setTimeout(..., N)` / fixed backoffs for pacing.
+Extension + CLI use the same rule: extension imports `gaussMs` from `extension/gemini-kb/src/shared/constants.js` (no `KB` globals); background `sleepGauss` is module-local; CLI `_gauss_sleep` — no flat `sleep(N)` / `setTimeout(..., N)` / fixed backoffs for pacing.

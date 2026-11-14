@@ -3,18 +3,23 @@
  * Prefers chrome.debugger trusted input (isTrusted: true) via the background;
  * falls back to improved synthetic DOM events if debugger is unavailable.
  */
-((global) => {
-  const { TrustedAction, MsgType } = global.KB || {};
+import { TrustedAction, MsgType, gaussMs } from "../shared/constants.js";
+import {
+  normalizePrompt,
+  composeCompareNormalize,
+  promptTextsMatch,
+  splitTypeAndPaste as splitTypeAndPastePure,
+} from "./compose_verify.js";
 
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   const rand = (min, max) => min + Math.random() * (max - min);
 
   const gaussianDelay = (mean, sigma, min, max) => {
-    if (typeof global.KB?.gaussMs === "function") {
-      return global.KB.gaussMs(mean, sigma, min, max);
+    if (typeof gaussMs === "function") {
+      return gaussMs(mean, sigma, min, max);
     }
-    // Fallback Box-Muller if constants.js not loaded: clamp away from 0 so Math.log(u) never -Inf / NaN.
+    // Fallback Box-Muller: clamp away from 0 so Math.log(u) never -Inf / NaN.
     const eps = Number.EPSILON;
     const u = Math.max(eps, Math.random());
     const v = Math.max(eps, Math.random());
@@ -29,13 +34,13 @@
 
   // Persist cursor across actions (avoid teleporting ±80px each click).
   const cursor = () => {
-    if (!global.__KB_CURSOR__) {
-      global.__KB_CURSOR__ = {
+    if (!globalThis.__KB_CURSOR__) {
+      globalThis.__KB_CURSOR__ = {
         x: window.innerWidth * 0.5,
         y: window.innerHeight * 0.5,
       };
     }
-    return global.__KB_CURSOR__;
+    return globalThis.__KB_CURSOR__;
   };
 
   const callTrusted = async (action, payload = {}) => {
@@ -45,9 +50,16 @@
         action,
         ...payload,
       });
-      return res && res.ok ? res : null;
-    } catch {
-      return null;
+      if (res?.aborted) {
+        throw Object.assign(new Error("command cancelled"), {
+          cancelled: true,
+          aborted: true,
+        });
+      }
+      return res || { ok: false };
+    } catch (err) {
+      if (err?.aborted || err?.cancelled) throw err;
+      return { ok: false, error: String(err?.message ?? err) };
     }
   };
 
@@ -68,6 +80,9 @@
   const keyMeta = (ch) => {
     if (ch === "\n" || ch === "Enter") {
       return { key: "Enter", code: "Enter", keyCode: 13, text: "\r" };
+    }
+    if (ch === "Escape" || ch === "Esc") {
+      return { key: "Escape", code: "Escape", keyCode: 27, text: "" };
     }
     if (ch === "Backspace") {
       return { key: "Backspace", code: "Backspace", keyCode: 8, text: "" };
@@ -133,7 +148,7 @@
       y: cur.y,
       steps,
     });
-    if (trusted) return;
+    if (trusted?.ok) return;
 
     const step = total / steps;
     const scrollEl = () =>
@@ -170,8 +185,9 @@
     }
   };
 
-  const humanClick = async (el) => {
+  const humanClick = async (el, opts = {}) => {
     if (!el) throw new Error("humanClick: missing element");
+    const forceCdp = !!opts.forceCdp;
     await scrollIntoViewHuman(el);
     const rect = el.getBoundingClientRect();
     const x = rect.left + rect.width * rand(0.25, 0.75);
@@ -183,16 +199,23 @@
       path: path.map((p) => ({ x: Math.round(p.x), y: Math.round(p.y) })),
       x: Math.round(x),
       y: Math.round(y),
+      ...(forceCdp ? { forceCdp: true } : {}),
     });
     cur.x = x;
     cur.y = y;
-    if (trusted) {
+    if (trusted?.ok) {
       try {
         el.focus();
       } catch {
         /* ignore */
       }
       return;
+    }
+    // Submit Send fallback must be CDP-trusted; never synthesize.
+    if (forceCdp) {
+      throw new Error(
+        `forceCdp click failed: ${trusted?.reason || trusted?.error || "not ok"}`
+      );
     }
 
     let prev = { x: cur.x, y: cur.y };
@@ -339,34 +362,6 @@
     }
   };
 
-  const deleteSelectionOrBackward = (el) => {
-    const sel = selectionIn(el);
-    if (!sel || !sel.rangeCount) return false;
-    try {
-      let range = sel.getRangeAt(0);
-      if (range.collapsed) {
-        // Extend one character backward (Chromium Selection#modify).
-        if (typeof sel.modify === "function") {
-          sel.modify("extend", "backward", "character");
-          if (!sel.rangeCount || sel.isCollapsed) return false;
-          range = sel.getRangeAt(0);
-        } else if (range.startOffset > 0 && range.startContainer.nodeType === Node.TEXT_NODE) {
-          range.setStart(range.startContainer, range.startOffset - 1);
-        } else {
-          return false;
-        }
-      }
-      range.deleteContents();
-      range.collapse(true);
-      sel.removeAllRanges();
-      sel.addRange(range);
-      fireEditorInput(el, "deleteContentBackward", null);
-      return true;
-    } catch {
-      return false;
-    }
-  };
-
   const clearContentEditable = (el) => {
     if (!selectAllIn(el)) return false;
     const sel = window.getSelection?.();
@@ -384,82 +379,8 @@
     }
   };
 
-  const insertCharFallback = (el, ch, isCE) => {
-    if (isCE) {
-      if (insertPlainAtCaret(el, ch, "insertText")) return;
-      // Last resort: append without replacing the whole node each time when possible
-      el.textContent = (el.textContent || "") + ch;
-      fireEditorInput(el, "insertText", ch);
-      return;
-    }
-    setNativeValue(el, (el.value || "") + ch);
-    fireEditorInput(el, "insertText", ch);
-  };
-
-  /** Bulk insert as a paste (not per-key). Selection/Range + insertFromPaste InputEvent. */
-  const insertPasteFallback = (el, chunk, isCE) => {
-    const data = String(chunk || "");
-    if (!data) return;
-    if (isCE) {
-      if (insertPlainAtCaret(el, data, "insertFromPaste")) return;
-      el.textContent = (el.textContent || "") + data;
-      fireEditorInput(el, "insertFromPaste", data);
-      return;
-    }
-    setNativeValue(el, (el.value || "") + data);
-    fireEditorInput(el, "insertFromPaste", data);
-  };
-
-  /**
-   * Long prompts: human-type a short prefix, paste the rest immediately.
-   * Short prompts: type everything (threshold below).
-   *
-   * CRITICAL: typePart must never contain \\n/\\r — Gemini treats bare Enter as
-   * submit, which truncated live prompts to headings like "## Context".
-   */
-  const PASTE_THRESHOLD = 48;
-  const TYPE_PREFIX_MIN = 20;
-  const TYPE_PREFIX_MAX = 48;
-
-  const splitTypeAndPaste = (text) => {
-    const s = String(text ?? "");
-    const firstNl = s.search(/[\r\n]/);
-    // Any multiline text: type only the first line fragment, paste from the newline.
-    // (Even below PASTE_THRESHOLD — otherwise per-key Enter submits mid-prompt.)
-    if (firstNl >= 0) {
-      let cut = firstNl;
-      if (cut > TYPE_PREFIX_MAX) {
-        const window = s.slice(0, TYPE_PREFIX_MAX + 24);
-        const space = window.search(/[ \t]\S*$/);
-        cut =
-          space >= TYPE_PREFIX_MIN
-            ? space + 1
-            : Math.min(TYPE_PREFIX_MAX, firstNl);
-      } else if (cut < 8 && s.length > PASTE_THRESHOLD) {
-        // Tiny first line ("## Context"): still type it, paste from newline.
-        cut = firstNl;
-      }
-      return { typePart: s.slice(0, cut), pastePart: s.slice(cut) };
-    }
-    if (s.length <= PASTE_THRESHOLD) return { typePart: s, pastePart: "" };
-    const target = Math.floor(rand(TYPE_PREFIX_MIN, TYPE_PREFIX_MAX + 1));
-    let cut = Math.min(target, s.length);
-    const window = s.slice(0, Math.min(s.length, target + 24));
-    const space = window.search(/[ \t]\S*$/);
-    if (space >= TYPE_PREFIX_MIN) cut = space + 1;
-    return { typePart: s.slice(0, cut), pastePart: s.slice(cut) };
-  };
-
-  const deleteCharFallback = (el, isCE) => {
-    if (isCE) {
-      if (deleteSelectionOrBackward(el)) return;
-      el.textContent = (el.textContent || "").slice(0, -1);
-      fireEditorInput(el, "deleteContentBackward", null);
-      return;
-    }
-    setNativeValue(el, (el.value || "").slice(0, -1));
-    fireEditorInput(el, "deleteContentBackward", null);
-  };
+  const splitTypeAndPaste = (text) =>
+    splitTypeAndPastePure(text, () => Math.random());
 
   const fireKeyPairFallback = async (el, ch) => {
     const meta = keyMeta(ch);
@@ -488,39 +409,6 @@
     );
   };
 
-  const typeCharsSynthetic = async (el, chars, isCE) => {
-    for (let i = 0; i < chars.length; i++) {
-      const ch = chars[i];
-      // Never key Enter for newlines during compose — that submits Gemini.
-      if (ch === "\n" || ch === "\r") {
-        insertPasteFallback(el, "\n", isCE);
-        await sleep(gaussianDelay(75, 25, 40, 140));
-        continue;
-      }
-      if (i > 0 && i % Math.floor(rand(8, 14)) === 0) {
-        await sleep(gaussianDelay(280, 80, 150, 550));
-      }
-      if (".?!".includes(ch)) {
-        await sleep(gaussianDelay(180, 50, 100, 350));
-      }
-
-      // Rare real typo: wrong char then Backspace then correct.
-      if (i > 12 && Math.random() < 0.025) {
-        const wrong = String.fromCharCode(97 + Math.floor(Math.random() * 26));
-        await fireKeyPairFallback(el, wrong);
-        insertCharFallback(el, wrong, isCE);
-        await sleep(gaussianDelay(90, 30, 40, 160));
-        await fireKeyPairFallback(el, "Backspace");
-        deleteCharFallback(el, isCE);
-        await sleep(gaussianDelay(70, 20, 40, 120));
-      }
-
-      await fireKeyPairFallback(el, ch);
-      insertCharFallback(el, ch, isCE);
-      await sleep(gaussianDelay(75, 25, 40, 140));
-    }
-  };
-
   const composerText = (el) => {
     if (!el) return "";
     if (el.isContentEditable || el.getAttribute("contenteditable") === "true") {
@@ -529,28 +417,11 @@
     return String(el.value || "");
   };
 
-  const normalizePrompt = (s) =>
-    String(s || "")
-      .replace(/\r\n/g, "\n")
-      .replace(/\r/g, "\n")
-      .replace(/\u00a0/g, " ")
-      .trim();
+  /** True when composer holds the intended prompt (Quill-aware squash compare). */
+  const composerHasPrompt = (el, text) =>
+    promptTextsMatch(composerText(el), text);
 
-  /** True when composer holds the intended prompt (length + head/tail needles). */
-  const composerHasPrompt = (el, text) => {
-    const want = normalizePrompt(text);
-    const have = normalizePrompt(composerText(el));
-    if (!want) return true;
-    if (!have) return false;
-    if (have === want) return true;
-    // Allow minor CE whitespace drift; require near-full length + anchors.
-    if (have.length < Math.floor(want.length * 0.92)) return false;
-    const head = want.slice(0, Math.min(32, want.length));
-    const tail = want.slice(-Math.min(32, want.length));
-    return have.includes(head) && (want.length < 40 || have.includes(tail));
-  };
-
-  const clearComposer = (el, isCE) => {
+  const clearComposerSync = (el, isCE) => {
     if (!isCE && (el.tagName === "TEXTAREA" || el.tagName === "INPUT")) {
       setNativeValue(el, "");
       fireEditorInput(el, "deleteByCut", null);
@@ -564,6 +435,48 @@
     }
   };
 
+  /** Clear Quill/CE; if text remains after a tick, one CDP select-all + Backspace. */
+  const clearComposer = async (el, isCE) => {
+    clearComposerSync(el, isCE);
+    await sleep(gaussianDelay(90, 25, 40, 180));
+    if (!normalizePrompt(composerText(el))) return;
+    try {
+      el.focus();
+    } catch {
+      /* ignore */
+    }
+    selectAllIn(el);
+    const wiped = await callTrusted(TrustedAction.KEY, keyMeta("Backspace"));
+    if (wiped?.ok) {
+      await sleep(gaussianDelay(80, 20, 40, 160));
+      return;
+    }
+    // Last resort without Enter: empty insert after select-all.
+    selectAllIn(el);
+    insertPlainAtCaret(el, "", "insertText");
+  };
+
+  const waitComposerHasPrompt = async (el, full) => {
+    let lastLen = normalizePrompt(composerText(el)).length;
+    let grewExtra = false;
+    for (let i = 0; i < 4; i++) {
+      if (composerHasPrompt(el, full)) return true;
+      await sleep(gaussianDelay(220, 60, 100, 420));
+      const len = normalizePrompt(composerText(el)).length;
+      if (len > lastLen) {
+        lastLen = len;
+        if (!grewExtra) {
+          grewExtra = true;
+          // One extra sample while Quill is still painting.
+          await sleep(gaussianDelay(280, 70, 120, 500));
+          if (composerHasPrompt(el, full)) return true;
+          lastLen = normalizePrompt(composerText(el)).length;
+        }
+      }
+    }
+    return composerHasPrompt(el, full);
+  };
+
   const humanType = async (el, text) => {
     if (!el) throw new Error("humanType: missing element");
     await humanClick(el);
@@ -572,83 +485,100 @@
 
     const isCE = el.isContentEditable || el.getAttribute("contenteditable") === "true";
     const full = String(text ?? "");
-    if (/[\r\n]/.test(splitTypeAndPaste(full).typePart)) {
+    const { typePart, pastePart } = splitTypeAndPaste(full);
+    if (/[\r\n]/.test(typePart)) {
       throw new Error("humanType: typePart must not contain newlines");
     }
 
-    clearComposer(el, isCE);
+    await clearComposer(el, isCE);
 
-    const fillOnce = async ({ allowTrusted }) => {
-      const { typePart, pastePart } = splitTypeAndPaste(full);
-      const typeChars = Array.from(typePart);
-      const typeDelays = typeChars.map((_, i) => {
-        let d = gaussianDelay(75, 25, 40, 140);
-        if (i > 0 && i % Math.floor(rand(8, 14)) === 0) d += gaussianDelay(280, 80, 150, 550);
-        if (".?!,".includes(typeChars[i])) d += gaussianDelay(160, 50, 80, 320);
-        return Math.round(d);
-      });
+    const typeChars = Array.from(typePart);
+    const typeDelays = typeChars.map((_, i) => {
+      let d = gaussianDelay(75, 25, 40, 140);
+      if (i > 0 && i % Math.floor(rand(8, 14)) === 0) d += gaussianDelay(280, 80, 150, 550);
+      if (".?!,".includes(typeChars[i])) d += gaussianDelay(160, 50, 80, 320);
+      return Math.round(d);
+    });
 
-      if (allowTrusted) {
-        // Multiline: one CDP insertText of the full prompt (Enter would submit).
-        if (pastePart) {
-          const pasted = await callTrusted(TrustedAction.PASTE, { text: full });
-          if (pasted && composerHasPrompt(el, full)) return;
-          if (pasted) {
-            // CDP reported ok but composer empty/partial — fall through to retry paths.
-            clearComposer(el, isCE);
-          }
-        } else if (typePart) {
-          const typed = await callTrusted(TrustedAction.TYPE, {
-            text: typePart,
-            delays: typeDelays,
-          });
-          if (typed && composerHasPrompt(el, full)) return;
-          if (typed) clearComposer(el, isCE);
-        }
-      }
-
-      if (typePart) await typeCharsSynthetic(el, typeChars, isCE);
-      if (pastePart) {
-        await sleep(gaussianDelay(180, 50, 90, 320));
-        try {
-          el.focus();
-        } catch {
-          /* ignore */
-        }
-        // Prefer CDP paste of the remainder (or full if type failed).
-        const pasted = await callTrusted(TrustedAction.PASTE, {
-          text: composerHasPrompt(el, typePart) ? pastePart : full,
-        });
-        if (!pasted) insertPasteFallback(el, pastePart, isCE);
-      }
+    const missingPromptError = (why, primary) => {
+      const haveRaw = composerText(el);
+      const have = composeCompareNormalize(haveRaw);
+      const want = composeCompareNormalize(full);
+      const okBit =
+        primary == null
+          ? ""
+          : ` primary.ok=${primary.ok === true} cdpTimeout=${!!primary.cdpTimeout}`;
+      return Object.assign(
+        new Error(
+          `composer missing full prompt after ${why} ` +
+            `(have ${have.length} chars, want ${want.length} squashed, raw ${full.length})${okBit}`
+        ),
+        { composeFailed: true, cdpTimeout: !!primary?.cdpTimeout }
+      );
     };
 
-    await fillOnce({ allowTrusted: true });
-    if (composerHasPrompt(el, full)) return;
+    // Always slow-type the prefix first; paste only the remainder (never skip TYPE).
+    let typed = { ok: true };
+    let pasted = { ok: true };
+    if (typePart) {
+      typed = await callTrusted(TrustedAction.TYPE, {
+        text: typePart,
+        delays: typeDelays,
+      });
+    }
+    if (pastePart) {
+      pasted = await callTrusted(TrustedAction.PASTE, { text: pastePart });
+    }
+    const primary = {
+      ok: !!(typed?.ok !== false && pasted?.ok !== false),
+      skipped: !!(typed?.skipped || pasted?.skipped),
+      cdpTimeout: !!(typed?.cdpTimeout || pasted?.cdpTimeout),
+      typedOk: typed?.ok !== false,
+      pastedOk: pasted?.ok !== false,
+    };
 
-    // Retry: clear + synthetic-only paste/type path.
-    clearComposer(el, isCE);
-    await sleep(gaussianDelay(120, 40, 60, 220));
+    if (await waitComposerHasPrompt(el, full)) return;
+
+    // CDP stall: clear then one full PASTE only — no re-type (avoid duplicate prefix).
+    const cdpFailed = primary && !primary.ok && !primary.skipped;
+    if (cdpFailed) {
+      // Do not clear while Quill is still growing.
+      const lenBefore = normalizePrompt(composerText(el)).length;
+      await sleep(gaussianDelay(200, 50, 100, 380));
+      const lenAfter = normalizePrompt(composerText(el)).length;
+      if (lenAfter > lenBefore) {
+        if (await waitComposerHasPrompt(el, full)) return;
+      }
+      await clearComposer(el, isCE);
+      try {
+        el.focus();
+      } catch {
+        /* ignore */
+      }
+      const recovery = await callTrusted(TrustedAction.PASTE, { text: full });
+      if (await waitComposerHasPrompt(el, full)) return;
+      throw Object.assign(
+        missingPromptError("CDP stall", {
+          ok: false,
+          cdpTimeout: !!(primary.cdpTimeout || recovery?.cdpTimeout),
+        }),
+        { cdpTimeout: !!(primary.cdpTimeout || recovery?.cdpTimeout) }
+      );
+    }
+
+    // Unexpected miss after ok CDP — one paste recovery, then fail.
+    await clearComposer(el, isCE);
     try {
       el.focus();
     } catch {
       /* ignore */
     }
-    await fillOnce({ allowTrusted: false });
-    // Final bulk insert if still short (last resort for stubborn CE).
-    if (!composerHasPrompt(el, full)) {
-      clearComposer(el, isCE);
-      insertPasteFallback(el, full, isCE);
-    }
-    if (!composerHasPrompt(el, full)) {
-      const have = normalizePrompt(composerText(el));
-      throw new Error(
-        `composer missing full prompt after type/paste (have ${have.length} chars, want ${full.length})`
-      );
-    }
+    await callTrusted(TrustedAction.PASTE, { text: full });
+    if (await waitComposerHasPrompt(el, full)) return;
+    throw missingPromptError("type/paste", primary);
   };
 
-  const humanKey = async (el, key) => {
+  const humanKey = async (el, key, opts = {}) => {
     if (el) {
       try {
         el.focus();
@@ -656,8 +586,14 @@
         /* ignore */
       }
     }
+    const requireCdp = !!opts.requireCdp;
     const trusted = await callTrusted(TrustedAction.KEY, keyMeta(key));
-    if (trusted) return;
+    if (trusted?.ok) return;
+    if (requireCdp) {
+      throw new Error(
+        `CDP key failed: ${trusted?.reason || trusted?.error || "not ok"}`
+      );
+    }
     if (el) await fireKeyPairFallback(el, key === "Enter" ? "\n" : key);
   };
 
@@ -671,7 +607,7 @@
     });
     cur.x = x;
     cur.y = y;
-    if (trusted) return;
+    if (trusted?.ok) return;
     let prev = { x: cur.x, y: cur.y };
     for (const p of path) {
       const target = document.elementFromPoint(p.x, p.y) || document.body;
@@ -681,18 +617,17 @@
     }
   };
 
-  global.KBHuman = {
-    sleep,
-    rand,
-    gaussianDelay,
-    betweenActions,
-    humanScroll,
-    scrollIntoViewHuman,
-    humanClick,
-    humanType,
-    humanKey,
-    wanderPointer,
-    composerText,
-    composerHasPrompt,
-  };
-})(globalThis);
+export {
+  sleep,
+  rand,
+  gaussianDelay,
+  betweenActions,
+  humanScroll,
+  scrollIntoViewHuman,
+  humanClick,
+  humanType,
+  humanKey,
+  wanderPointer,
+  composerText,
+  composerHasPrompt,
+};

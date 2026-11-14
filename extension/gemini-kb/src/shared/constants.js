@@ -1,8 +1,7 @@
 /**
  * Wire-protocol string variants (keep in sync with knowledge_base.ext_protocol).
  */
-((global) => {
-  const freeze = (o) => Object.freeze(o);
+const freeze = (o) => Object.freeze(o);
 
   /** Box–Muller sample, rounded ms, clamped to [min, max]. */
   const gaussMs = (mean, sigma, min, max) => {
@@ -105,18 +104,17 @@
     CANCELLED: "cancelled",
   });
 
-  global.KB = freeze({
-    gaussMs,
-    CommandKind,
-    Capability,
-    CAPABILITIES,
-    TrustedAction,
-    EventType,
-    CommandStatus,
-    Effort,
-    EFFORT_VALUES,
-    SearchSource,
-    ExtractSource,
-    MsgType,
-  });
-})(typeof globalThis !== "undefined" ? globalThis : self);
+export {
+  gaussMs,
+  CommandKind,
+  Capability,
+  CAPABILITIES,
+  TrustedAction,
+  EventType,
+  CommandStatus,
+  Effort,
+  EFFORT_VALUES,
+  SearchSource,
+  ExtractSource,
+  MsgType,
+};
