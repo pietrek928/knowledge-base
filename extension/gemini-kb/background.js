@@ -3,6 +3,18 @@
  * remote-command poll loop against the knowledge-base server.
  */
 
+importScripts("constants.js");
+
+const {
+  CommandKind,
+  CAPABILITIES,
+  TrustedAction,
+  EventType,
+  CommandStatus,
+  MsgType,
+  gaussMs,
+} = globalThis.KB;
+
 const DEFAULTS = {
   kbUrl: "http://127.0.0.1:8080",
   autoSave: true,
@@ -26,6 +38,7 @@ const HEARTBEAT_ALARM = "gemini_kb_heartbeat";
 
 let pollRunning = false;
 let commandBusy = false;
+let lastBusyHeartbeatAt = 0;
 let backoffUntil = 0;
 let lastRegisterOk = null;
 
@@ -84,19 +97,14 @@ const healthOk = async () => {
   }
 };
 
-const gaussian = (mean, sigma, min, max) => {
-  let u = 0;
-  let v = 0;
-  while (u === 0) u = Math.random();
-  while (v === 0) v = Math.random();
-  const z = Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
-  const val = mean + z * sigma;
-  return Math.max(min, Math.min(max, val));
-};
+const gaussian = (mean, sigma, min, max) => gaussMs(mean, sigma, min, max);
 
 const sleep = (ms) => {
   return new Promise((r) => setTimeout(r, ms));
 };
+
+/** Sleep a Gaussian duration (never a flat constant). */
+const sleepGauss = (mean, sigma, min, max) => sleep(gaussian(mean, sigma, min, max));
 
 /** @type {Set<number>} */
 const debuggerSessions = new Set();
@@ -172,22 +180,9 @@ const trustedType = async (tabId, { text, delays }) => {
   for (let i = 0; i < chars.length; i++) {
     const ch = chars[i];
     const delay = (delays && delays[i]) || Math.round(gaussian(75, 25, 40, 140));
-    if (ch === "\n") {
-      await dbg(tabId, "Input.dispatchKeyEvent", {
-        type: "keyDown",
-        key: "Enter",
-        code: "Enter",
-        windowsVirtualKeyCode: 13,
-        nativeVirtualKeyCode: 13,
-      });
-      await sleep(gaussian(50, 15, 30, 90));
-      await dbg(tabId, "Input.dispatchKeyEvent", {
-        type: "keyUp",
-        key: "Enter",
-        code: "Enter",
-        windowsVirtualKeyCode: 13,
-        nativeVirtualKeyCode: 13,
-      });
+    if (ch === "\n" || ch === "\r") {
+      // Bare Enter submits Gemini; insert a newline without sending.
+      await dbg(tabId, "Input.insertText", { text: "\n" });
     } else {
       await dbg(tabId, "Input.dispatchKeyEvent", {
         type: "keyDown",
@@ -203,6 +198,15 @@ const trustedType = async (tabId, { text, delays }) => {
     }
     await sleep(delay);
   }
+  return true;
+};
+
+/** Bulk insert (paste-like) via CDP — no per-key delays. */
+const trustedPaste = async (tabId, { text }) => {
+  if (!(await debuggerAttach(tabId))) return false;
+  const chunk = String(text || "");
+  if (!chunk) return true;
+  await dbg(tabId, "Input.insertText", { text: chunk });
   return true;
 };
 
@@ -249,34 +253,38 @@ const trustedWheel = async (tabId, { deltaY, x, y, steps }) => {
 
 const handleTrustedInput = async (tabId, msg) => {
   if (!tabId) return { ok: false, error: "no tab" };
-  if (msg.action === "detach") {
+  if (msg.action === TrustedAction.DETACH) {
     await debuggerDetach(tabId);
     return { ok: true };
   }
   const state = await getState();
-  if (!state.trustedInput) {
-    // Default path: synthetic DOM input in the content script (no debugger banner).
+  // TYPE/PASTE always use CDP: document.execCommand is deprecated and Range+synthetic
+  // InputEvent does not stick in Gemini's Angular contenteditable. The popup
+  // "trustedInput" flag still gates click/move/wheel (debugger banner for those).
+  const alwaysCdp =
+    msg.action === TrustedAction.TYPE || msg.action === TrustedAction.PASTE;
+  if (!state.trustedInput && !alwaysCdp) {
     return { ok: false, skipped: true, reason: "trustedInput disabled" };
   }
   try {
-    if (msg.action === "click") {
-      return { ok: await trustedClick(tabId, msg) };
+    switch (msg.action) {
+      case TrustedAction.CLICK:
+        return { ok: await trustedClick(tabId, msg) };
+      case TrustedAction.MOVE:
+        if (!(await debuggerAttach(tabId))) return { ok: false };
+        await trustedMovePath(tabId, msg.path || []);
+        return { ok: true };
+      case TrustedAction.TYPE:
+        return { ok: await trustedType(tabId, msg) };
+      case TrustedAction.PASTE:
+        return { ok: await trustedPaste(tabId, msg) };
+      case TrustedAction.KEY:
+        return { ok: await trustedKey(tabId, msg) };
+      case TrustedAction.WHEEL:
+        return { ok: await trustedWheel(tabId, msg) };
+      default:
+        return { ok: false, error: `unknown action ${msg.action}` };
     }
-    if (msg.action === "move") {
-      if (!(await debuggerAttach(tabId))) return { ok: false };
-      await trustedMovePath(tabId, msg.path || []);
-      return { ok: true };
-    }
-    if (msg.action === "type") {
-      return { ok: await trustedType(tabId, msg) };
-    }
-    if (msg.action === "key") {
-      return { ok: await trustedKey(tabId, msg) };
-    }
-    if (msg.action === "wheel") {
-      return { ok: await trustedWheel(tabId, msg) };
-    }
-    return { ok: false, error: `unknown action ${msg.action}` };
   } catch (err) {
     logWarn("trusted input failed", String(err?.message ?? err));
     return { ok: false, error: String(err?.message ?? err) };
@@ -297,14 +305,18 @@ const scheduleCaptchaBackoff = async (reason = "captcha") => {
   const strikes = (state.captchaStrikes || 0) + 1;
   // 30m, 60m, 120m… capped at 24h
   const minutes = Math.min(24 * 60, 30 * Math.pow(2, Math.min(strikes - 1, 6)));
-  const until = Date.now() + minutes * 60_000;
+  const baseMs = minutes * 60_000;
+  const until = Date.now() + gaussian(baseMs, baseMs * 0.12, baseMs * 0.75, baseMs * 1.25);
   await setState({
     captchaBlockedUntil: until,
     captchaStrikes: strikes,
     captchaNeedsUser: true,
   });
   backoffUntil = until;
-  logWarn(reason, `backoff ${minutes}m strike=${strikes}; needs user gesture to clear`);
+  logWarn(
+    reason,
+    `backoff ~${Math.round((until - Date.now()) / 60_000)}m strike=${strikes}; needs user gesture to clear`
+  );
   return until;
 };
 
@@ -436,7 +448,7 @@ const weeklySweep = async () => {
       await sleep(gaussian(4000, 800, 2500, 6000));
       try {
         await waitTabReady(tab.id);
-        await chrome.tabs.sendMessage(tab.id, { type: "gemini_push_now" });
+        await chrome.tabs.sendMessage(tab.id, { type: MsgType.PUSH_NOW });
         await sleep(gaussian(20_000, 4_000, 12_000, 35_000));
       } catch {
         /* tab may not be ready / logged out */
@@ -469,13 +481,14 @@ const registerOrHeartbeat = async () => {
     browser_id: browserId,
     account: state.account || null,
     conversation_ids,
-    capabilities: ["query", "search", "list-models", "page-html"],
+    capabilities: [...CAPABILITIES],
   };
   try {
     const res = await kbFetch("/ext/register", { method: "POST", body: JSON.stringify(body) });
     if (res.status === 429) {
-      backoffUntil = Date.now() + 60_000;
-      logWarn("register rate-limited (429); backing off 60s");
+      const wait = gaussian(60_000, 12_000, 35_000, 95_000);
+      backoffUntil = Date.now() + wait;
+      logWarn("register rate-limited (429); backing off", Math.round(wait / 1000), "s");
       lastRegisterOk = false;
       return false;
     }
@@ -570,7 +583,7 @@ const injectContentScripts = async (tabId) => {
   // Needed after extension reload: existing Gemini tabs keep the old page without CS.
   await chrome.scripting.executeScript({
     target: { tabId },
-    files: ["human.js", "gemini_models.js", "content.js"],
+    files: ["constants.js", "human.js", "gemini_models.js", "content.js"],
   });
 };
 
@@ -578,7 +591,7 @@ const refreshPickerHelpers = async (tabId) => {
   // Re-assign KBGeminiModels from disk without duplicating content.js listeners.
   await chrome.scripting.executeScript({
     target: { tabId },
-    files: ["human.js", "gemini_models.js"],
+    files: ["constants.js", "human.js", "gemini_models.js"],
   });
 };
 
@@ -590,7 +603,7 @@ const waitTabReady = async (tabId, timeoutMs = 25000) => {
   let buildReloaded = false;
   while (Date.now() - start < timeoutMs) {
     try {
-      const ping = await chrome.tabs.sendMessage(tabId, { type: "kb_ping" });
+      const ping = await chrome.tabs.sendMessage(tabId, { type: MsgType.PING });
       if (ping && ping.ok) {
         // Unpacked updates leave old content scripts until navigation/reload.
         if (ping.build && ping.build !== wantBuild && !buildReloaded) {
@@ -598,7 +611,7 @@ const waitTabReady = async (tabId, timeoutMs = 25000) => {
           buildReloaded = true;
           reloaded = true;
           await chrome.tabs.reload(tabId);
-          await sleep(2000);
+          await sleepGauss(2200, 500, 1400, 3600);
           continue;
         }
         return ping;
@@ -606,12 +619,12 @@ const waitTabReady = async (tabId, timeoutMs = 25000) => {
     } catch {
       /* not ready / no receiver */
     }
-    if (!injected && Date.now() - start > 1200) {
+    if (!injected && Date.now() - start > gaussian(1200, 250, 800, 1800)) {
       try {
         await injectContentScripts(tabId);
         injected = true;
         log("injected content scripts into tab", tabId);
-        await sleep(500);
+        await sleepGauss(550, 120, 300, 900);
         continue;
       } catch (err) {
         logWarn("script inject failed", String(err?.message ?? err));
@@ -619,19 +632,19 @@ const waitTabReady = async (tabId, timeoutMs = 25000) => {
       }
     }
     // After extension reload, a hard refresh re-runs content_scripts matches.
-    if (!reloaded && Date.now() - start > 6000) {
+    if (!reloaded && Date.now() - start > gaussian(6000, 900, 4500, 8500)) {
       try {
         log("reloading tab to attach content scripts", tabId);
         await chrome.tabs.reload(tabId);
         reloaded = true;
-        await sleep(2000);
+        await sleepGauss(2200, 500, 1400, 3600);
         continue;
       } catch (err) {
         logWarn("tab reload failed", String(err?.message ?? err));
         reloaded = true;
       }
     }
-    await sleep(400);
+    await sleepGauss(420, 90, 220, 750);
   }
   throw new Error("content script not ready");
 };
@@ -643,7 +656,7 @@ const runRemoteCommand = async (cmd) => {
 
   const state0 = await getState();
   if (state0.captchaNeedsUser || Date.now() < backoffUntil || Date.now() < state0.captchaBlockedUntil) {
-    await postEvent(commandId, "error", {
+    await postEvent(commandId, EventType.ERROR, {
       error: state0.captchaNeedsUser
         ? "captcha backoff active — open the extension popup after solving /sorry"
         : "captcha/backoff active",
@@ -654,28 +667,46 @@ const runRemoteCommand = async (cmd) => {
 
   // Pace after query writes: reading-time dwell, not a few seconds.
   const state = await getState();
-  if (kind === "query") {
+  if (kind === CommandKind.QUERY) {
     const until = Math.max(state.nextQueryAfter || 0, state.lastQueryAt || 0);
     const wait = until - Date.now();
     if (wait > 0) {
       log("pacing before query", Math.round(wait / 1000), "s");
-      await sleep(wait);
+      await sleepGauss(wait, wait * 0.08, wait * 0.85, wait * 1.15);
     }
   } else {
-    await sleep(gaussian(800, 250, 400, 1600));
+    await sleepGauss(800, 250, 400, 1600);
   }
 
   let created = false;
   let tab = null;
   try {
-    await postEvent(commandId, "running", { kind });
-    const forNew = kind === "query" && !params.conversation_id;
+    await postEvent(commandId, EventType.RUNNING, { kind });
+    const forNew = kind === CommandKind.QUERY && !params.conversation_id;
     const opened = await findOrCreateTab(params.conversation_id || null, { forNew });
     tab = opened.tab;
     created = opened.created;
-    await postEvent(commandId, "tab_opened", { tabId: tab.id, created, url: tab.url });
+    // chrome.tabs.create can return before url is set; wait for a real gemini /app URL.
+    const isGeminiApp = (u) => /gemini\.google\.com\/app/i.test(u || "");
+    if (!isGeminiApp(tab.url)) {
+      for (let i = 0; i < 15; i++) {
+        await sleepGauss(380, 90, 180, 700);
+        try {
+          tab = await chrome.tabs.get(tab.id);
+        } catch {
+          break;
+        }
+        if (isGeminiApp(tab.url)) break;
+      }
+    }
+    await postEvent(commandId, EventType.TAB_OPENED, { tabId: tab.id, created, url: tab.url });
     // Settle after navigation before first gesture.
-    await sleep(created ? gaussian(3500, 600, 2500, 5500) : gaussian(1200, 300, 700, 2200));
+    await sleepGauss(
+      created ? 3500 : 1200,
+      created ? 600 : 300,
+      created ? 2500 : 700,
+      created ? 5500 : 2200
+    );
     let ping = await waitTabReady(tab.id);
     if (ping.account) await setState({ account: ping.account });
 
@@ -683,7 +714,7 @@ const runRemoteCommand = async (cmd) => {
     const wantCid = (params.conversation_id || "").toLowerCase() || null;
     if (wantCid && ping.conversation_id !== wantCid) {
       await chrome.tabs.update(tab.id, { url: `https://gemini.google.com/app/${wantCid}` });
-      await sleep(2500);
+      await sleepGauss(2600, 500, 1600, 4200);
       ping = await waitTabReady(tab.id);
       if (ping.conversation_id && ping.conversation_id !== wantCid) {
         throw new Error(
@@ -699,7 +730,7 @@ const runRemoteCommand = async (cmd) => {
       logWarn("refreshPickerHelpers failed", String(err?.message ?? err));
     }
 
-    // Idle timeout extends while Gemini is generating or reply HTML is growing.
+    // Idle timeout extends only on real progress; hardDeadline is the safety net.
     const timeoutMs = Math.max(15, Math.min(600, Number(cmd.timeout_s) || Number(params.timeout_s) || 180)) * 1000;
     const hardMs = Math.min(600_000, Math.max(timeoutMs * 3, timeoutMs + 120_000));
     const startedAt = Date.now();
@@ -708,30 +739,60 @@ const runRemoteCommand = async (cmd) => {
     let lastResponseLen = -1;
     let settled = null;
     let settleErr = null;
+    let aborted = false;
+    let lastStatusPollAt = 0;
 
     const bumpIdle = () => {
       idleDeadline = Math.min(hardDeadline, Date.now() + timeoutMs);
     };
 
+    const signalContentCancel = async (reason) => {
+      aborted = true;
+      try {
+        await chrome.tabs.sendMessage(tab.id, {
+          type: MsgType.REMOTE_CANCEL,
+          commandId,
+          reason: reason || "cancelled",
+        });
+      } catch {
+        /* content may already be gone */
+      }
+    };
+
+    const fetchCommandStatus = async () => {
+      try {
+        const res = await kbFetch(`/ext/commands/${encodeURIComponent(commandId)}`);
+        if (!res.ok) return null;
+        const body = await res.json();
+        return body?.status || null;
+      } catch {
+        return null;
+      }
+    };
+
     const onMsg = (msg) => {
-      if (!msg || msg.type !== "kb_remote_event" || msg.commandId !== commandId) return;
+      if (!msg || msg.type !== MsgType.REMOTE_EVENT || msg.commandId !== commandId) return;
+      if (aborted) return;
       postEvent(commandId, msg.eventType, msg.payload);
       const p = msg.payload || {};
-      if (
-        msg.eventType === "submitted" ||
-        msg.eventType === "turn" ||
-        msg.eventType === "model_selected"
-      ) {
-        bumpIdle();
-        return;
-      }
-      if (msg.eventType === "delta") {
-        if (p.generating) bumpIdle();
-        // Any length change (grow or shrink-then-regrow), not only a high-water mark.
-        if (typeof p.response_len === "number" && p.response_len !== lastResponseLen) {
-          lastResponseLen = p.response_len;
+      switch (msg.eventType) {
+        case EventType.SUBMITTED:
+        case EventType.TURN:
+        case EventType.MODEL_SELECTED:
           bumpIdle();
-        }
+          break;
+        case EventType.DELTA:
+          // Composing/generating/len change only — not empty poll ticks.
+          if (p.generating || p.composing) bumpIdle();
+          if (typeof p.response_len === "number" && p.response_len !== lastResponseLen) {
+            lastResponseLen = p.response_len;
+            bumpIdle();
+          }
+          break;
+        default:
+          // list-models scrape progress (model_selected phases already handled).
+          if (kind === CommandKind.LIST_MODELS) bumpIdle();
+          break;
       }
     };
     chrome.runtime.onMessage.addListener(onMsg);
@@ -742,7 +803,7 @@ const runRemoteCommand = async (cmd) => {
     try {
       const sendP = chrome.tabs
         .sendMessage(tab.id, {
-          type: "kb_remote",
+          type: MsgType.REMOTE,
           commandId,
           kind,
           params: contentParams,
@@ -760,14 +821,35 @@ const runRemoteCommand = async (cmd) => {
         const now = Date.now();
         if (now >= hardDeadline || now >= idleDeadline) {
           const secs = Math.round((now - startedAt) / 1000);
-          throw new Error(
-            `content command timed out after ${secs}s` +
-              (now >= hardDeadline ? " (hard cap)" : " (idle — no Gemini progress)")
+          const hard = now >= hardDeadline;
+          await signalContentCancel(hard ? "timeout_hard" : "timeout_idle");
+          throw Object.assign(
+            new Error(
+              `content command timed out after ${secs}s` +
+                (hard ? " (hard cap)" : " (idle — no Gemini progress)")
+            ),
+            { timeout: true }
           );
         }
-        await Promise.race([sendP.catch(() => null), sleep(400)]);
+        // Poll broker so CLI cancel/timeout aborts in-flight content work.
+        if (now - lastStatusPollAt > 900) {
+          lastStatusPollAt = now;
+          const st = await fetchCommandStatus();
+          if (st === CommandStatus.CANCELLED || st === CommandStatus.TIMEOUT) {
+            await signalContentCancel(st);
+            throw Object.assign(new Error(`command ${st}`), {
+              cancelled: st === CommandStatus.CANCELLED,
+              timeout: st === CommandStatus.TIMEOUT,
+            });
+          }
+        }
+        // Do NOT bumpIdle on empty poll ticks — idle and broker timeout must be able to fire.
+        await Promise.race([sendP.catch(() => null), sleepGauss(420, 90, 220, 750)]);
       }
       if (settleErr) throw settleErr;
+      if (aborted) {
+        throw Object.assign(new Error("command cancelled"), { cancelled: true });
+      }
       response = settled;
     } finally {
       chrome.runtime.onMessage.removeListener(onMsg);
@@ -776,40 +858,75 @@ const runRemoteCommand = async (cmd) => {
     if (!response || !response.ok) {
       if (response && response.captcha) {
         await scheduleCaptchaBackoff("captcha from content");
-        await postEvent(commandId, "error", {
+        await postEvent(commandId, EventType.ERROR, {
           error: response.error || "captcha",
           captcha: true,
         });
         return;
       }
-      await postEvent(commandId, "error", { error: (response && response.error) || "command failed" });
+      if (response && response.cancelled) {
+        await postEvent(commandId, EventType.CANCELLED, {
+          error: response.error || "command cancelled",
+          cancelled: true,
+        });
+        return;
+      }
+      await postEvent(commandId, EventType.ERROR, {
+        error: (response && response.error) || "command failed",
+      });
       return;
     }
 
     const result = response.result || {};
 
-    // Live ingest for query / search-with-messages
-    if (kind === "query" && result.conversation_id && result.turns) {
-      await ingestTurns({
-        conversationId: result.conversation_id,
-        title: result.title,
-        turns: result.turns,
-        complete: result.complete !== false,
-      });
-      const replyChars = (result.turns || [])
-        .filter((t) => t.role === "gemini" || t.role === "model")
-        .reduce((n, t) => n + String(t.text || "").length, 0);
-      const promptChars = String(params.text || "").length;
-      const gap = readingGapMs(replyChars, promptChars);
-      await setState({
-        lastQueryAt: Date.now(),
-        lastReplyChars: replyChars,
-        nextQueryAfter: Date.now() + gap,
-        captchaStrikes: 0,
-      });
-      log("next query after reading dwell", Math.round(gap / 1000), "s");
+    const turnsLookReal = (turns, complete) => {
+      if (!Array.isArray(turns) || !turns.length) return false;
+      if (complete === false) return false;
+      return turns.some(
+        (t) =>
+          (t.role === "gemini" || t.role === "model") && String(t.text || "").trim()
+      );
+    };
+
+    // Live ingest for query / search-with-messages — empty/stale must not look like success.
+    if (kind === CommandKind.QUERY) {
+      if (!turnsLookReal(result.turns, result.complete)) {
+        await postEvent(commandId, EventType.ERROR, {
+          error: "stale or empty extract; refusing success",
+          conversation_id: result.conversation_id || null,
+          turn_count: Array.isArray(result.turns) ? result.turns.length : 0,
+          complete: result.complete,
+        });
+        return;
+      }
+      if (result.conversation_id && result.turns) {
+        await ingestTurns({
+          conversationId: result.conversation_id,
+          title: result.title,
+          turns: result.turns,
+          complete: result.complete !== false,
+        });
+        const replyChars = (result.turns || [])
+          .filter((t) => t.role === "gemini" || t.role === "model")
+          .reduce((n, t) => n + String(t.text || "").length, 0);
+        const promptChars = String(params.text || "").length;
+        const gap = readingGapMs(replyChars, promptChars);
+        await setState({
+          lastQueryAt: Date.now(),
+          lastReplyChars: replyChars,
+          nextQueryAfter: Date.now() + gap,
+          captchaStrikes: 0,
+        });
+        log("next query after reading dwell", Math.round(gap / 1000), "s");
+      }
     }
-    if (kind === "search" && params.conversation_id && result.turns) {
+    if (
+      kind === CommandKind.SEARCH &&
+      params.conversation_id &&
+      Array.isArray(result.turns) &&
+      result.turns.length &&
+      result.complete !== false
+    ) {
       await ingestTurns({
         conversationId: params.conversation_id,
         title: result.title || params.conversation_id,
@@ -818,13 +935,23 @@ const runRemoteCommand = async (cmd) => {
       });
     }
 
-    await postEvent(commandId, "done", result);
+    if (aborted) {
+      await postEvent(commandId, EventType.CANCELLED, { error: "command cancelled" });
+      return;
+    }
+    await postEvent(commandId, EventType.DONE, result);
   } catch (err) {
     const msg = String(err?.message ?? err);
     if (/sorry|captcha/i.test(msg)) {
       await scheduleCaptchaBackoff("captcha exception");
     }
-    await postEvent(commandId, "error", { error: msg });
+    if (err?.cancelled) {
+      await postEvent(commandId, EventType.CANCELLED, { error: msg, cancelled: true });
+    } else if (err?.timeout) {
+      await postEvent(commandId, EventType.TIMEOUT, { error: msg });
+    } else {
+      await postEvent(commandId, EventType.ERROR, { error: msg });
+    }
   } finally {
     // Keep chat tabs open (closing after send is a bot tell). Detach debugger.
     if (tab && tab.id) {
@@ -844,52 +971,67 @@ const pollLoop = async () => {
   try {
     while (true) {
       if (commandBusy) {
-        await sleep(500);
+        // Poll is skipped while busy; refresh last_seen so broker TTL (60s) does not
+        // drop browsers[] during long query/pacing (heartbeat alarm alone can miss).
+        if (Date.now() - lastBusyHeartbeatAt > gaussian(15_000, 3_000, 10_000, 22_000)) {
+          lastBusyHeartbeatAt = Date.now();
+          try {
+            await registerOrHeartbeat();
+          } catch {
+            /* soft */
+          }
+        }
+        await sleepGauss(520, 120, 280, 900);
         continue;
       }
       if (Date.now() < backoffUntil) {
-        await sleep(2000);
+        await sleepGauss(2100, 450, 1200, 3500);
         continue;
       }
       const browserId = await ensureBrowserId();
       let res;
       try {
-        res = await kbFetch(`/ext/poll?browser_id=${encodeURIComponent(browserId)}&wait_s=20`);
+        const waitS = Math.max(8, Math.min(25, Math.round(gaussian(18, 4, 10, 24))));
+        res = await kbFetch(
+          `/ext/poll?browser_id=${encodeURIComponent(browserId)}&wait_s=${waitS}`
+        );
       } catch (err) {
         logWarn("poll failed", String(err?.message ?? err));
-        await sleep(3000);
+        await sleepGauss(3200, 700, 1600, 5500);
         continue;
       }
       if (res.status === 204) {
         continue;
       }
       if (res.status === 429) {
-        backoffUntil = Date.now() + 60_000;
-        logWarn("poll rate-limited (429); backing off 60s");
+        const wait = gaussian(60_000, 12_000, 35_000, 95_000);
+        backoffUntil = Date.now() + wait;
+        logWarn("poll rate-limited (429); backing off", Math.round(wait / 1000), "s");
         continue;
       }
       if (!res.ok) {
         logWarn("poll HTTP", res.status);
-        await sleep(2000);
+        await sleepGauss(2100, 450, 1200, 3500);
         continue;
       }
       const cmd = await res.json();
       if (!cmd || !cmd.id) continue;
       log("claimed command", cmd.kind, cmd.id?.slice?.(0, 8) || cmd.id);
       commandBusy = true;
+      lastBusyHeartbeatAt = Date.now();
       try {
         await runRemoteCommand(cmd);
       } finally {
         commandBusy = false;
         // serialize: jitter after each command
-        await sleep(gaussian(600, 150, 300, 1200));
+        await sleepGauss(600, 150, 300, 1200);
       }
     }
   } finally {
     pollRunning = false;
     logWarn("poll loop stopped; restarting");
     // restart later
-    setTimeout(() => pollLoop(), 2000);
+    setTimeout(() => pollLoop(), gaussian(2200, 500, 1200, 4000));
   }
 };
 
@@ -924,82 +1066,83 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
     if (!msg || !msg.type) return;
 
-    if (msg.type === "kb_trusted_input") {
-      const tabId = sender.tab?.id;
-      sendResponse(await handleTrustedInput(tabId, msg));
-      return;
-    }
-
-    if (msg.type === "clear_captcha_gate") {
-      // User opened the popup / acknowledged — allow queries again after /sorry.
-      await setState({
-        captchaNeedsUser: false,
-        captchaBlockedUntil: 0,
-        captchaStrikes: 0,
-      });
-      backoffUntil = 0;
-      sendResponse({ ok: true });
-      return;
-    }
-
-    if (msg.type === "gemini_extract_result") {
-      const state = await getState();
-      if (!state.autoSave && !msg.force) {
-        sendResponse({ ignored: true });
+    switch (msg.type) {
+      case MsgType.TRUSTED_INPUT: {
+        const tabId = sender.tab?.id;
+        sendResponse(await handleTrustedInput(tabId, msg));
         return;
       }
-      const result = await ingestTurns(msg);
-      sendResponse(result);
-      return;
-    }
 
-    if (msg.type === "kb_remote_event") {
-      // handled via temporary listener during command; also accept orphaned
-      sendResponse({ ok: true });
-      return;
-    }
-
-    if (msg.type === "get_state") {
-      await reconcileDocs();
-      sendResponse(await getState());
-      return;
-    }
-
-    if (msg.type === "set_settings") {
-      const patch = {};
-      if (typeof msg.kbUrl === "string") patch.kbUrl = msg.kbUrl;
-      if (typeof msg.autoSave === "boolean") patch.autoSave = msg.autoSave;
-      if (typeof msg.trustedInput === "boolean") patch.trustedInput = msg.trustedInput;
-      await setState(patch);
-      // Turning trusted input off: drop any live debugger sessions.
-      if (patch.trustedInput === false) {
-        for (const tabId of [...debuggerSessions]) {
-          await debuggerDetach(tabId);
-        }
-      }
-      sendResponse(await getState());
-      return;
-    }
-
-    if (msg.type === "push_active_tab") {
-      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-      if (!tab?.id || !tab.url?.includes("gemini.google.com/app")) {
-        sendResponse({ ok: false, error: "Open a gemini.google.com/app tab" });
-        return;
-      }
-      try {
-        await chrome.tabs.sendMessage(tab.id, { type: "gemini_push_now" });
+      case MsgType.CLEAR_CAPTCHA_GATE:
+        // User opened the popup / acknowledged — allow queries again after /sorry.
+        await setState({
+          captchaNeedsUser: false,
+          captchaBlockedUntil: 0,
+          captchaStrikes: 0,
+        });
+        backoffUntil = 0;
         sendResponse({ ok: true });
-      } catch (e) {
-        sendResponse({ ok: false, error: String(e) });
-      }
-      return;
-    }
+        return;
 
-    if (msg.type === "run_sweep") {
-      weeklySweep();
-      sendResponse({ ok: true });
-      return;
+      case MsgType.EXTRACT_RESULT: {
+        const state = await getState();
+        if (!state.autoSave && !msg.force) {
+          sendResponse({ ignored: true });
+          return;
+        }
+        sendResponse(await ingestTurns(msg));
+        return;
+      }
+
+      case MsgType.REMOTE_EVENT:
+        // handled via temporary listener during command; also accept orphaned
+        sendResponse({ ok: true });
+        return;
+
+      case MsgType.GET_STATE:
+        await reconcileDocs();
+        sendResponse(await getState());
+        return;
+
+      case MsgType.SET_SETTINGS: {
+        const patch = {};
+        if (typeof msg.kbUrl === "string") patch.kbUrl = msg.kbUrl;
+        if (typeof msg.autoSave === "boolean") patch.autoSave = msg.autoSave;
+        if (typeof msg.trustedInput === "boolean") patch.trustedInput = msg.trustedInput;
+        await setState(patch);
+        // Turning trusted input off: drop debugger sessions unless a command is mid-flight
+        // (TYPE/PASTE still need CDP; detaching mid-command breaks compose).
+        if (patch.trustedInput === false && !commandBusy) {
+          for (const tabId of [...debuggerSessions]) {
+            await debuggerDetach(tabId);
+          }
+        }
+        sendResponse(await getState());
+        return;
+      }
+
+      case MsgType.PUSH_ACTIVE_TAB: {
+        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        if (!tab?.id || !tab.url?.includes("gemini.google.com/app")) {
+          sendResponse({ ok: false, error: "Open a gemini.google.com/app tab" });
+          return;
+        }
+        try {
+          await chrome.tabs.sendMessage(tab.id, { type: MsgType.PUSH_NOW });
+          sendResponse({ ok: true });
+        } catch (e) {
+          sendResponse({ ok: false, error: String(e) });
+        }
+        return;
+      }
+
+      case MsgType.RUN_SWEEP:
+        weeklySweep();
+        sendResponse({ ok: true });
+        return;
+
+      default:
+        return;
     }
   })();
   return true;

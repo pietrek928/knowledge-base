@@ -54,6 +54,76 @@ async def test_broker_register_poll_events():
 
 
 @pytest.mark.asyncio
+async def test_broker_cancel_clears_busy():
+    broker = ExtBroker()
+    await broker.register("b1", account="a@x.com")
+    cmd = await broker.enqueue("query", {"text": "hello", "timeout_s": 60})
+    polled = await broker.poll("b1", wait_s=1)
+    assert polled is not None
+    assert broker.live_browsers()[0]["busy"] is True
+
+    cancelled = await broker.cancel(cmd["id"])
+    assert cancelled["status"] == "cancelled"
+    assert cancelled["result"]["cancelled"] is True
+    assert broker.live_browsers()[0]["busy"] is False
+
+    # Idempotent on already-terminal
+    again = await broker.cancel(cmd["id"])
+    assert again["status"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_ext_cancel_http(tmp_path):
+    cfg = {
+        "data_dir": str(tmp_path / "kb-cancel"),
+        "models": [],
+        "token_budget": 400,
+        "fusion": "cc",
+        "fusion_weights": {"exact": 0.5, "fuzzy": 0.2, "bm25": 0.3, "embed": 0.0},
+        "rrf_k": 60,
+        "adaptive_fusion": False,
+        "rescore_multiplier": 2,
+        "candidate_k": 5,
+        "bm25": {"k1": 0.9, "b": 0.75},
+        "sibling_window": 0,
+        "sibling_base": 0.0,
+        "complement_bonus": 0.0,
+        "cross_signal_bonus": 0.0,
+        "sibling_inject_max": 0,
+        "identifier_fast_path": True,
+        "min_confidence": None,
+        "date": {"half_life_days": 30, "weight": 0.0},
+        "query_cache_size": 4,
+        "metadata_max_bytes": 4096,
+        "ollama": {
+            "enabled": False,
+            "base_url": "http://127.0.0.1:9",
+            "keep_alive": "1m",
+            "timeout_s": 1,
+            "batch_size": 1,
+        },
+    }
+    app = create_app(cfg, fake_ollama=True)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        await client.post("/ext/register", json={"browser_id": "ext-c", "account": "u@x.com"})
+        r = await client.post(
+            "/ext/commands",
+            json={"kind": "query", "params": {"text": "hi", "timeout_s": 60}},
+        )
+        cmd_id = r.json()["id"]
+        poll = await client.get("/ext/poll", params={"browser_id": "ext-c", "wait_s": 2})
+        assert poll.status_code == 200
+        busy = await client.get("/ext/browsers")
+        assert any(b["busy"] for b in busy.json()["browsers"])
+        c = await client.post(f"/ext/commands/{cmd_id}/cancel")
+        assert c.status_code == 200
+        assert c.json()["status"] == "cancelled"
+        busy2 = await client.get("/ext/browsers")
+        assert all(not b["busy"] for b in busy2.json()["browsers"])
+
+
+@pytest.mark.asyncio
 async def test_broker_cache_search_only(tmp_path):
     cfg = {
         "data_dir": str(tmp_path / "kb"),

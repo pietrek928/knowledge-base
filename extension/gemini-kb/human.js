@@ -4,15 +4,20 @@
  * falls back to improved synthetic DOM events if debugger is unavailable.
  */
 ((global) => {
+  const { TrustedAction, MsgType } = global.KB || {};
+
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   const rand = (min, max) => min + Math.random() * (max - min);
 
   const gaussianDelay = (mean, sigma, min, max) => {
-    let u = 0;
-    let v = 0;
-    while (u === 0) u = Math.random();
-    while (v === 0) v = Math.random();
+    if (typeof global.KB?.gaussMs === "function") {
+      return global.KB.gaussMs(mean, sigma, min, max);
+    }
+    // Fallback Box-Muller if constants.js not loaded: clamp away from 0 so Math.log(u) never -Inf / NaN.
+    const eps = Number.EPSILON;
+    const u = Math.max(eps, Math.random());
+    const v = Math.max(eps, Math.random());
     const z = Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
     const val = mean + z * sigma;
     return Math.max(min, Math.min(max, val));
@@ -36,7 +41,7 @@
   const callTrusted = async (action, payload = {}) => {
     try {
       const res = await chrome.runtime.sendMessage({
-        type: "kb_trusted_input",
+        type: MsgType.TRUSTED_INPUT,
         action,
         ...payload,
       });
@@ -115,28 +120,54 @@
   };
 
   const humanScroll = async (deltaY) => {
-    const trusted = await callTrusted("wheel", {
-      deltaY,
-      x: cursor().x,
-      y: cursor().y,
-      steps: Math.max(3, Math.min(12, Math.round(Math.abs(deltaY) / 80))),
+    const cap = gaussianDelay(520, 120, 240, 720);
+    const sign = deltaY === 0 ? 1 : Math.sign(deltaY);
+    const mag = Math.min(Math.abs(deltaY), cap);
+    const total = sign * mag;
+    const steps = Math.max(3, Math.min(8, Math.round(mag / 80)));
+    const cur = cursor();
+
+    const trusted = await callTrusted(TrustedAction.WHEEL, {
+      deltaY: total,
+      x: cur.x,
+      y: cur.y,
+      steps,
     });
     if (trusted) return;
 
-    const steps = Math.max(3, Math.min(12, Math.round(Math.abs(deltaY) / 80)));
-    const step = deltaY / steps;
+    const step = total / steps;
+    const scrollEl = () =>
+      document.elementFromPoint(cur.x, cur.y) ||
+      document.scrollingElement ||
+      document.body;
     for (let i = 0; i < steps; i++) {
-      window.scrollBy(0, step + rand(-4, 4));
+      const dy = step + rand(-4, 4);
+      const target = scrollEl();
+      target.dispatchEvent(
+        new WheelEvent("wheel", {
+          bubbles: true,
+          cancelable: true,
+          view: window,
+          deltaY: dy,
+          deltaMode: 0,
+          clientX: cur.x,
+          clientY: cur.y,
+        })
+      );
       await sleep(gaussianDelay(40, 12, 16, 80));
     }
   };
 
   const scrollIntoViewHuman = async (el) => {
-    const rect = el.getBoundingClientRect();
-    const mid = rect.top + rect.height / 2;
-    const target = window.innerHeight * 0.45;
-    const delta = mid - target;
-    if (Math.abs(delta) > 40) await humanScroll(delta);
+    for (let iter = 0; iter < 3; iter++) {
+      const rect = el.getBoundingClientRect();
+      const mid = rect.top + rect.height / 2;
+      const targetY = window.innerHeight * 0.45;
+      const delta = mid - targetY;
+      if (Math.abs(delta) <= 40) return;
+      await humanScroll(delta);
+      if (iter < 2) await sleep(gaussianDelay(320, 90, 160, 640));
+    }
   };
 
   const humanClick = async (el) => {
@@ -148,7 +179,7 @@
     const cur = cursor();
     const path = bezierPoints(cur.x, cur.y, x, y, Math.floor(rand(14, 28)));
 
-    const trusted = await callTrusted("click", {
+    const trusted = await callTrusted(TrustedAction.CLICK, {
       path: path.map((p) => ({ x: Math.round(p.x), y: Math.round(p.y) })),
       x: Math.round(x),
       y: Math.round(y),
@@ -205,41 +236,229 @@
     else el.value = value;
   };
 
+  /**
+   * Modern CE editing without deprecated document.execCommand.
+   * Selection/Range mutates the DOM; InputEvent (beforeinput + input) notifies
+   * framework listeners (Angular/Gemini). Trusted CDP path remains preferred.
+   */
+  const fireEditorInput = (el, inputType, data = null) => {
+    try {
+      el.dispatchEvent(
+        new InputEvent("beforeinput", {
+          bubbles: true,
+          cancelable: true,
+          composed: true,
+          inputType,
+          data,
+        })
+      );
+    } catch {
+      /* InputEvent ctor / beforeinput unsupported */
+    }
+    try {
+      el.dispatchEvent(
+        new InputEvent("input", {
+          bubbles: true,
+          composed: true,
+          inputType,
+          data,
+        })
+      );
+    } catch {
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+    }
+  };
+
+  const selectionIn = (el) => {
+    const sel = window.getSelection?.();
+    if (!sel) return null;
+    if (sel.rangeCount && el.contains(sel.anchorNode)) return sel;
+    try {
+      const range = document.createRange();
+      range.selectNodeContents(el);
+      range.collapse(false);
+      sel.removeAllRanges();
+      sel.addRange(range);
+      return sel;
+    } catch {
+      return null;
+    }
+  };
+
+  const selectAllIn = (el) => {
+    const sel = window.getSelection?.();
+    if (!sel) return false;
+    try {
+      const range = document.createRange();
+      range.selectNodeContents(el);
+      sel.removeAllRanges();
+      sel.addRange(range);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  /** Insert plain text at caret (newlines → <br>). Replaces any selection. */
+  const insertPlainAtCaret = (el, text, inputType = "insertText") => {
+    const data = String(text ?? "");
+    const sel = selectionIn(el);
+    if (!sel || !sel.rangeCount) return false;
+    try {
+      const range = sel.getRangeAt(0);
+      range.deleteContents();
+      const frag = document.createDocumentFragment();
+      const parts = data.split("\n");
+      let lastNode = null;
+      for (let i = 0; i < parts.length; i++) {
+        if (i > 0) {
+          lastNode = document.createElement("br");
+          frag.appendChild(lastNode);
+        }
+        if (parts[i]) {
+          lastNode = document.createTextNode(parts[i]);
+          frag.appendChild(lastNode);
+        }
+      }
+      if (!lastNode && data === "") {
+        // no-op insert (used after select-all clear)
+        fireEditorInput(el, inputType, data || null);
+        return true;
+      }
+      range.insertNode(frag);
+      if (lastNode) {
+        range.setStartAfter(lastNode);
+        range.collapse(true);
+        sel.removeAllRanges();
+        sel.addRange(range);
+      }
+      fireEditorInput(el, inputType, data || null);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  const deleteSelectionOrBackward = (el) => {
+    const sel = selectionIn(el);
+    if (!sel || !sel.rangeCount) return false;
+    try {
+      let range = sel.getRangeAt(0);
+      if (range.collapsed) {
+        // Extend one character backward (Chromium Selection#modify).
+        if (typeof sel.modify === "function") {
+          sel.modify("extend", "backward", "character");
+          if (!sel.rangeCount || sel.isCollapsed) return false;
+          range = sel.getRangeAt(0);
+        } else if (range.startOffset > 0 && range.startContainer.nodeType === Node.TEXT_NODE) {
+          range.setStart(range.startContainer, range.startOffset - 1);
+        } else {
+          return false;
+        }
+      }
+      range.deleteContents();
+      range.collapse(true);
+      sel.removeAllRanges();
+      sel.addRange(range);
+      fireEditorInput(el, "deleteContentBackward", null);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  const clearContentEditable = (el) => {
+    if (!selectAllIn(el)) return false;
+    const sel = window.getSelection?.();
+    if (!sel?.rangeCount) return false;
+    try {
+      const range = sel.getRangeAt(0);
+      range.deleteContents();
+      range.collapse(true);
+      sel.removeAllRanges();
+      sel.addRange(range);
+      fireEditorInput(el, "deleteByCut", null);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
   const insertCharFallback = (el, ch, isCE) => {
     if (isCE) {
-      try {
-        document.execCommand("insertText", false, ch);
-        return;
-      } catch {
-        /* fall through */
-      }
+      if (insertPlainAtCaret(el, ch, "insertText")) return;
       // Last resort: append without replacing the whole node each time when possible
       el.textContent = (el.textContent || "") + ch;
-      el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: ch }));
+      fireEditorInput(el, "insertText", ch);
       return;
     }
     setNativeValue(el, (el.value || "") + ch);
-    el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: ch }));
+    fireEditorInput(el, "insertText", ch);
+  };
+
+  /** Bulk insert as a paste (not per-key). Selection/Range + insertFromPaste InputEvent. */
+  const insertPasteFallback = (el, chunk, isCE) => {
+    const data = String(chunk || "");
+    if (!data) return;
+    if (isCE) {
+      if (insertPlainAtCaret(el, data, "insertFromPaste")) return;
+      el.textContent = (el.textContent || "") + data;
+      fireEditorInput(el, "insertFromPaste", data);
+      return;
+    }
+    setNativeValue(el, (el.value || "") + data);
+    fireEditorInput(el, "insertFromPaste", data);
+  };
+
+  /**
+   * Long prompts: human-type a short prefix, paste the rest immediately.
+   * Short prompts: type everything (threshold below).
+   *
+   * CRITICAL: typePart must never contain \\n/\\r — Gemini treats bare Enter as
+   * submit, which truncated live prompts to headings like "## Context".
+   */
+  const PASTE_THRESHOLD = 48;
+  const TYPE_PREFIX_MIN = 20;
+  const TYPE_PREFIX_MAX = 48;
+
+  const splitTypeAndPaste = (text) => {
+    const s = String(text ?? "");
+    const firstNl = s.search(/[\r\n]/);
+    // Any multiline text: type only the first line fragment, paste from the newline.
+    // (Even below PASTE_THRESHOLD — otherwise per-key Enter submits mid-prompt.)
+    if (firstNl >= 0) {
+      let cut = firstNl;
+      if (cut > TYPE_PREFIX_MAX) {
+        const window = s.slice(0, TYPE_PREFIX_MAX + 24);
+        const space = window.search(/[ \t]\S*$/);
+        cut =
+          space >= TYPE_PREFIX_MIN
+            ? space + 1
+            : Math.min(TYPE_PREFIX_MAX, firstNl);
+      } else if (cut < 8 && s.length > PASTE_THRESHOLD) {
+        // Tiny first line ("## Context"): still type it, paste from newline.
+        cut = firstNl;
+      }
+      return { typePart: s.slice(0, cut), pastePart: s.slice(cut) };
+    }
+    if (s.length <= PASTE_THRESHOLD) return { typePart: s, pastePart: "" };
+    const target = Math.floor(rand(TYPE_PREFIX_MIN, TYPE_PREFIX_MAX + 1));
+    let cut = Math.min(target, s.length);
+    const window = s.slice(0, Math.min(s.length, target + 24));
+    const space = window.search(/[ \t]\S*$/);
+    if (space >= TYPE_PREFIX_MIN) cut = space + 1;
+    return { typePart: s.slice(0, cut), pastePart: s.slice(cut) };
   };
 
   const deleteCharFallback = (el, isCE) => {
     if (isCE) {
-      try {
-        document.execCommand("delete", false);
-        return;
-      } catch {
-        /* fall through */
-      }
+      if (deleteSelectionOrBackward(el)) return;
       el.textContent = (el.textContent || "").slice(0, -1);
-      el.dispatchEvent(
-        new InputEvent("input", { bubbles: true, inputType: "deleteContentBackward", data: null })
-      );
+      fireEditorInput(el, "deleteContentBackward", null);
       return;
     }
     setNativeValue(el, (el.value || "").slice(0, -1));
-    el.dispatchEvent(
-      new InputEvent("input", { bubbles: true, inputType: "deleteContentBackward", data: null })
-    );
+    fireEditorInput(el, "deleteContentBackward", null);
   };
 
   const fireKeyPairFallback = async (el, ch) => {
@@ -269,46 +488,15 @@
     );
   };
 
-  const humanType = async (el, text) => {
-    if (!el) throw new Error("humanType: missing element");
-    await humanClick(el);
-    await sleep(gaussianDelay(180, 50, 100, 350));
-    el.focus();
-
-    const isCE = el.isContentEditable || el.getAttribute("contenteditable") === "true";
-
-    // Clear existing content once
-    if (!isCE && (el.tagName === "TEXTAREA" || el.tagName === "INPUT")) {
-      setNativeValue(el, "");
-      el.dispatchEvent(new Event("input", { bubbles: true }));
-    } else if (isCE) {
-      try {
-        document.execCommand("selectAll", false);
-        document.execCommand("delete", false);
-      } catch {
-        el.textContent = "";
-        el.dispatchEvent(
-          new InputEvent("input", { bubbles: true, inputType: "deleteContentBackward" })
-        );
-      }
-    }
-
-    const chars = Array.from(String(text));
-    const trusted = await callTrusted("type", {
-      text: String(text),
-      // Precomputed inter-key delays so background can stay dumb.
-      delays: chars.map((_, i) => {
-        let d = gaussianDelay(75, 25, 40, 140);
-        if (i > 0 && i % Math.floor(rand(8, 14)) === 0) d += gaussianDelay(280, 80, 150, 550);
-        if (".?!,".includes(chars[i])) d += gaussianDelay(160, 50, 80, 320);
-        return Math.round(d);
-      }),
-    });
-    if (trusted) return;
-
-    // Synthetic fallback with better event shape than wholesale textContent replace.
+  const typeCharsSynthetic = async (el, chars, isCE) => {
     for (let i = 0; i < chars.length; i++) {
       const ch = chars[i];
+      // Never key Enter for newlines during compose — that submits Gemini.
+      if (ch === "\n" || ch === "\r") {
+        insertPasteFallback(el, "\n", isCE);
+        await sleep(gaussianDelay(75, 25, 40, 140));
+        continue;
+      }
       if (i > 0 && i % Math.floor(rand(8, 14)) === 0) {
         await sleep(gaussianDelay(280, 80, 150, 550));
       }
@@ -333,6 +521,133 @@
     }
   };
 
+  const composerText = (el) => {
+    if (!el) return "";
+    if (el.isContentEditable || el.getAttribute("contenteditable") === "true") {
+      return (el.innerText || el.textContent || "").replace(/\u00a0/g, " ");
+    }
+    return String(el.value || "");
+  };
+
+  const normalizePrompt = (s) =>
+    String(s || "")
+      .replace(/\r\n/g, "\n")
+      .replace(/\r/g, "\n")
+      .replace(/\u00a0/g, " ")
+      .trim();
+
+  /** True when composer holds the intended prompt (length + head/tail needles). */
+  const composerHasPrompt = (el, text) => {
+    const want = normalizePrompt(text);
+    const have = normalizePrompt(composerText(el));
+    if (!want) return true;
+    if (!have) return false;
+    if (have === want) return true;
+    // Allow minor CE whitespace drift; require near-full length + anchors.
+    if (have.length < Math.floor(want.length * 0.92)) return false;
+    const head = want.slice(0, Math.min(32, want.length));
+    const tail = want.slice(-Math.min(32, want.length));
+    return have.includes(head) && (want.length < 40 || have.includes(tail));
+  };
+
+  const clearComposer = (el, isCE) => {
+    if (!isCE && (el.tagName === "TEXTAREA" || el.tagName === "INPUT")) {
+      setNativeValue(el, "");
+      fireEditorInput(el, "deleteByCut", null);
+      return;
+    }
+    // Avoid textContent wipe (breaks Angular CE binding).
+    if (clearContentEditable(el)) return;
+    if (normalizePrompt(composerText(el))) {
+      selectAllIn(el);
+      insertPlainAtCaret(el, "", "insertText");
+    }
+  };
+
+  const humanType = async (el, text) => {
+    if (!el) throw new Error("humanType: missing element");
+    await humanClick(el);
+    await sleep(gaussianDelay(180, 50, 100, 350));
+    el.focus();
+
+    const isCE = el.isContentEditable || el.getAttribute("contenteditable") === "true";
+    const full = String(text ?? "");
+    if (/[\r\n]/.test(splitTypeAndPaste(full).typePart)) {
+      throw new Error("humanType: typePart must not contain newlines");
+    }
+
+    clearComposer(el, isCE);
+
+    const fillOnce = async ({ allowTrusted }) => {
+      const { typePart, pastePart } = splitTypeAndPaste(full);
+      const typeChars = Array.from(typePart);
+      const typeDelays = typeChars.map((_, i) => {
+        let d = gaussianDelay(75, 25, 40, 140);
+        if (i > 0 && i % Math.floor(rand(8, 14)) === 0) d += gaussianDelay(280, 80, 150, 550);
+        if (".?!,".includes(typeChars[i])) d += gaussianDelay(160, 50, 80, 320);
+        return Math.round(d);
+      });
+
+      if (allowTrusted) {
+        // Multiline: one CDP insertText of the full prompt (Enter would submit).
+        if (pastePart) {
+          const pasted = await callTrusted(TrustedAction.PASTE, { text: full });
+          if (pasted && composerHasPrompt(el, full)) return;
+          if (pasted) {
+            // CDP reported ok but composer empty/partial — fall through to retry paths.
+            clearComposer(el, isCE);
+          }
+        } else if (typePart) {
+          const typed = await callTrusted(TrustedAction.TYPE, {
+            text: typePart,
+            delays: typeDelays,
+          });
+          if (typed && composerHasPrompt(el, full)) return;
+          if (typed) clearComposer(el, isCE);
+        }
+      }
+
+      if (typePart) await typeCharsSynthetic(el, typeChars, isCE);
+      if (pastePart) {
+        await sleep(gaussianDelay(180, 50, 90, 320));
+        try {
+          el.focus();
+        } catch {
+          /* ignore */
+        }
+        // Prefer CDP paste of the remainder (or full if type failed).
+        const pasted = await callTrusted(TrustedAction.PASTE, {
+          text: composerHasPrompt(el, typePart) ? pastePart : full,
+        });
+        if (!pasted) insertPasteFallback(el, pastePart, isCE);
+      }
+    };
+
+    await fillOnce({ allowTrusted: true });
+    if (composerHasPrompt(el, full)) return;
+
+    // Retry: clear + synthetic-only paste/type path.
+    clearComposer(el, isCE);
+    await sleep(gaussianDelay(120, 40, 60, 220));
+    try {
+      el.focus();
+    } catch {
+      /* ignore */
+    }
+    await fillOnce({ allowTrusted: false });
+    // Final bulk insert if still short (last resort for stubborn CE).
+    if (!composerHasPrompt(el, full)) {
+      clearComposer(el, isCE);
+      insertPasteFallback(el, full, isCE);
+    }
+    if (!composerHasPrompt(el, full)) {
+      const have = normalizePrompt(composerText(el));
+      throw new Error(
+        `composer missing full prompt after type/paste (have ${have.length} chars, want ${full.length})`
+      );
+    }
+  };
+
   const humanKey = async (el, key) => {
     if (el) {
       try {
@@ -341,7 +656,7 @@
         /* ignore */
       }
     }
-    const trusted = await callTrusted("key", keyMeta(key));
+    const trusted = await callTrusted(TrustedAction.KEY, keyMeta(key));
     if (trusted) return;
     if (el) await fireKeyPairFallback(el, key === "Enter" ? "\n" : key);
   };
@@ -351,7 +666,7 @@
     const x = Math.max(20, Math.min(window.innerWidth - 20, cur.x + rand(-120, 120)));
     const y = Math.max(20, Math.min(window.innerHeight - 20, cur.y + rand(-80, 80)));
     const path = bezierPoints(cur.x, cur.y, x, y, Math.floor(rand(8, 16)));
-    const trusted = await callTrusted("move", {
+    const trusted = await callTrusted(TrustedAction.MOVE, {
       path: path.map((p) => ({ x: Math.round(p.x), y: Math.round(p.y) })),
     });
     cur.x = x;
@@ -372,9 +687,12 @@
     gaussianDelay,
     betweenActions,
     humanScroll,
+    scrollIntoViewHuman,
     humanClick,
     humanType,
     humanKey,
     wanderPointer,
+    composerText,
+    composerHasPrompt,
   };
 })(globalThis);

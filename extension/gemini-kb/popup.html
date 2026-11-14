@@ -101,7 +101,7 @@
     </div>
     <div class="row">
       <input id="trustedInput" type="checkbox" />
-      <span>Trusted input (debugger — shows banner, can trip anti-bot)</span>
+      <span>Trusted input for click/move/wheel (debugger banner; TYPE/PASTE always use CDP)</span>
     </div>
     <div class="row">
       <button id="saveSettings" class="secondary">Save settings</button>
@@ -109,6 +109,7 @@
     </div>
     <div id="status"></div>
     <div id="list"></div>
+    <script src="constants.js"></script>
     <script src="popup.js"></script>
   </body>
 </html>

@@ -1,3 +1,5 @@
+const { MsgType, gaussMs } = globalThis.KB;
+
 const kbUrlEl = document.getElementById("kbUrl");
 const autoSaveEl = document.getElementById("autoSave");
 const trustedInputEl = document.getElementById("trustedInput");
@@ -41,7 +43,7 @@ const escapeHtml = (s) => {
 };
 
 const refresh = () => {
-  chrome.runtime.sendMessage({ type: "get_state" }, (state) => {
+  chrome.runtime.sendMessage({ type: MsgType.GET_STATE }, (state) => {
     if (!state) {
       setStatus("Background unavailable");
       return;
@@ -56,7 +58,7 @@ const refresh = () => {
     let status = `Tracked: ${n}${pending ? ` · pending: ${pending}` : ""}`;
     if (state.captchaNeedsUser || (state.captchaBlockedUntil || 0) > Date.now()) {
       status += " · captcha gate (cleared on popup open)";
-      chrome.runtime.sendMessage({ type: "clear_captcha_gate" });
+      chrome.runtime.sendMessage({ type: MsgType.CLEAR_CAPTCHA_GATE });
     }
     setStatus(status);
     renderChats(state.chats);
@@ -66,7 +68,7 @@ const refresh = () => {
 document.getElementById("saveSettings").addEventListener("click", () => {
   chrome.runtime.sendMessage(
     {
-      type: "set_settings",
+      type: MsgType.SET_SETTINGS,
       kbUrl: kbUrlEl.value.trim(),
       autoSave: autoSaveEl.checked,
       trustedInput: trustedInputEl.checked,
@@ -74,8 +76,8 @@ document.getElementById("saveSettings").addEventListener("click", () => {
     () => {
       setStatus(
         trustedInputEl.checked
-          ? "Saved — debugger input ON (banner may appear)"
-          : "Saved — synthetic input (default)"
+          ? "Saved — click/move/wheel use CDP (banner may appear); TYPE/PASTE always CDP"
+          : "Saved — click/move/wheel synthetic; TYPE/PASTE still always use CDP"
       );
       refresh();
     }
@@ -84,13 +86,13 @@ document.getElementById("saveSettings").addEventListener("click", () => {
 
 document.getElementById("pushNow").addEventListener("click", () => {
   setStatus("Pushing…");
-  chrome.runtime.sendMessage({ type: "push_active_tab" }, (res) => {
+  chrome.runtime.sendMessage({ type: MsgType.PUSH_ACTIVE_TAB }, (res) => {
     if (!res?.ok) {
       setStatus(res?.error || "Push failed");
       return;
     }
     setStatus("Extract requested — check status after a few seconds");
-    setTimeout(refresh, 3000);
+    setTimeout(refresh, gaussMs(3200, 700, 1800, 5500));
   });
 });
 

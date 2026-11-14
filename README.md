@@ -108,24 +108,27 @@ With the extension loaded and `kb serve` running, the extension **registers**, *
 
 ```bash
 uv run kb-cli browsers
-uv run kb-cli list-models
-uv run kb-cli list-models --conversation-id <id>   # profile-scoped picker
+uv run kb-cli list-models          # unlocked labels + efforts only; also returns locked[]
+uv run kb-cli list-models --conversation-id <id>
+uv run kb-cli conversations        # cached gemini/* threads (logical path + store_path)
 uv run kb-cli page-html -o /tmp/gemini.html
 uv run kb-cli page-html --selector 'button[aria-label*="model" i]' --max-chars 50000
-uv run kb-cli list-models   # use exact labels Gemini shows (e.g. Argon:high)
-uv run kb-cli query "explain batch_size" --model Argon:high
-uv run kb-cli query "follow-up" --conversation-id <id>
+# Exact unlocked label from list-models (do not invent :high unless listed):
+uv run kb-cli query "explain batch_size" --model 'Code & analysis 4 Argon'
+uv run kb-cli query "follow-up" --conversation-id <id> --timeout 420 --final-json
 uv run kb-cli search -q Parallel --source cache --source gemini-live
 uv run kb-cli search --conversation-id <id> -q batch_size --source cache
 ```
 
-- **`query`**: opens/reuses a Gemini tab, optionally selects model/effort, types with humanized timing, waits for generation (timeout), streams JSON events, and **ingests** the thread. If Gemini auto-switches models (quota), a `model_changed` event is emitted.
-- **`search`**: without `--conversation-id` returns conversation hits; with it, message hits. `--source cache` reads the KB store; `gemini-live` fans out to connected browsers (merged by account).
+- **`query`**: opens/reuses a Gemini tab, optionally selects model/effort, types with humanized timing (long text: short prefix + paste), waits for generation, streams **NDJSON events** (one JSON object per line), and **ingests** the thread. Use `--final-json` for a single terminal command blob (scripts/`json.load`). Ctrl+C / SIGINT / SIGTERM cancel the command, abort in-flight extension work, and clear browser `busy`. Late `done` cannot overwrite `cancelled`/`timeout`. If the chip does not match the requested model, `model_changed` is set.
+- **`list-models`**: unlocked picker rows only. Per-model `efforts` start from an embedded token or `["medium"]`, then may gain `high` only after an **Argon-only** picker probe proves an unlocked High row (probe restores the prior model afterward). Top-level `thinking_levels` / `debug.effort_levels_seen` are scrape hints — **not** permission to pass `:high`. Locked/paywall rows appear under `locked` — do not query them (e.g. Carbon unlock).
+- **`conversations`**: lists cached `gemini/` docs. Logical `path` is `gemini/{id}.md`; on disk under `data_dir` as `content/{path}.json` (e.g. `~/.kb/content/gemini/{id}.md.json`) — not a file in the repo cwd.
+- **`search`**: without `--conversation-id` returns conversation hits; with it, message hits. `--source cache` reads the KB store; `gemini-live` fans out to connected browsers. Hits include `store_path` hints.
 - **`page-html`**: dumps live page HTML for debugging (`--selector`, `--max-chars`, `-o` to write the body to a file).
 - Multiple browsers: `kb-cli browsers` lists them; pass `--browser-id` / `--account` to route. Live search merges all accounts.
-- Extension uses synthetic humanized typing/clicks by default (no debugger banner). Optional **Trusted input** in the popup enables `chrome.debugger` (better `isTrusted`, but shows a banner and can trip anti-bot). Also: reading-time pacing, DOM-first extract, exponential captcha backoff (open the popup after `/sorry` to clear the gate).
+- Extension input: **TYPE/PASTE always use CDP debugger** (even when popup **Trusted input** is off). That checkbox only gates **click/move/wheel** (debugger banner, can trip anti-bot). Saving Trusted input off does not detach mid-command. Also: reading-time pacing, DOM-first extract, exponential captcha backoff (open the popup after `/sorry` to clear the gate).
 
-Broker HTTP: `/ext/register`, `/ext/poll`, `/ext/events`, `/ext/commands`, `/ext/commands/{id}/wait`, `/ext/browsers`.
+Broker HTTP: `/ext/register`, `/ext/poll`, `/ext/events`, `/ext/commands`, `/ext/commands/{id}/wait`, `/ext/commands/{id}/cancel`, `/ext/browsers`.
 
 ## Ollama CPU usage
 

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Gemini → Knowledge Base",
-  "version": "0.3.4",
+  "version": "0.3.18",
   "description": "Auto-save Gemini chats and run remote query/search commands via a local knowledge base.",
   "permissions": ["storage", "alarms", "tabs", "scripting", "debugger"],
   "host_permissions": [
@@ -33,7 +33,7 @@
         "https://gemini.google.com/app/",
         "https://gemini.google.com/app/*"
       ],
-      "js": ["human.js", "gemini_models.js", "content.js"],
+      "js": ["constants.js", "human.js", "gemini_models.js", "content.js"],
       "run_at": "document_idle"
     }
   ]

@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 
 from knowledge_base.config import load_config
 from knowledge_base.ext_broker import ExtBroker
+from knowledge_base.ext_protocol import Capability, CommandKind, EventType
 from knowledge_base.service import KnowledgeBase
 
 _STATIC = Path(__file__).resolve().parent / "static"
@@ -62,7 +63,7 @@ class SearchRequest(BaseModel):
 class ExtRegisterRequest(BaseModel):
     browser_id: str
     account: str | None = None
-    capabilities: list[str] | None = None
+    capabilities: list[Capability] | None = None
     conversation_ids: list[str] | None = None
 
 
@@ -74,13 +75,13 @@ class ExtHeartbeatRequest(BaseModel):
 
 class ExtEventRequest(BaseModel):
     command_id: str
-    type: str
+    type: EventType
     payload: dict[str, Any] | None = None
     seq: int | None = None
 
 
 class ExtCommandRequest(BaseModel):
-    kind: str
+    kind: CommandKind
     params: dict[str, Any] | None = None
 
 
@@ -246,6 +247,13 @@ def create_app(cfg: dict[str, Any] | None = None, *, fake_ollama: bool | None = 
     ) -> dict[str, Any]:
         try:
             return await broker.wait(command_id, timeout_s=timeout_s)
+        except KeyError as e:
+            raise HTTPException(404, "command not found") from e
+
+    @app.post("/ext/commands/{command_id}/cancel")
+    async def ext_command_cancel(command_id: str) -> dict[str, Any]:
+        try:
+            return await broker.cancel(command_id)
         except KeyError as e:
             raise HTTPException(404, "command not found") from e
 

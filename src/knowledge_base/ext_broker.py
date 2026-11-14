@@ -10,6 +10,16 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from knowledge_base.ext_protocol import (
+    TERMINAL_STATUSES,
+    CommandKind,
+    CommandStatus,
+    Effort,
+    EventType,
+    SearchSource,
+    normalize_command_kind,
+)
+
 log = logging.getLogger(__name__)
 
 BROWSER_TTL_S = 60.0
@@ -17,7 +27,7 @@ POLL_MAX_S = 25.0
 DEFAULT_QUERY_TIMEOUT_S = 180
 MIN_TIMEOUT_S = 10
 MAX_TIMEOUT_S = 600
-TERMINAL = frozenset({"done", "error", "timeout"})
+TERMINAL = TERMINAL_STATUSES  # alias for callers/tests
 
 
 def clamp_timeout(v: Any, default: int = DEFAULT_QUERY_TIMEOUT_S) -> int:
@@ -35,9 +45,9 @@ def parse_model_spec(spec: str | None) -> tuple[str | None, str | None]:
     raw = str(spec).strip()
     if ":" in raw:
         model, effort = raw.rsplit(":", 1)
-        model, effort = model.strip(), effort.strip() or "medium"
+        model, effort = model.strip(), effort.strip() or Effort.MEDIUM
         return model or None, effort
-    return raw, "medium"
+    return raw, Effort.MEDIUM
 
 
 @dataclass
@@ -55,8 +65,11 @@ class Command:
     id: str
     kind: str
     params: dict[str, Any]
-    status: str = "pending"  # pending|claimed|running|done|error|timeout
+    status: str = CommandStatus.PENDING
     created_at: float = field(default_factory=time.monotonic)
+    # Wall-clock for timeout starts when work begins (running), not enqueue —
+    # extension pacing before "running" must not eat the CLI timeout budget.
+    started_at: float | None = None
     timeout_s: int = DEFAULT_QUERY_TIMEOUT_S
     target_browser_id: str | None = None
     target_account: str | None = None
@@ -95,21 +108,36 @@ class ExtBroker:
                 acc or "-",
             )
 
+    def _cmd_age_s(self, cmd: Command) -> float:
+        """Seconds counted against timeout_s.
+
+        Prefer started_at (set on first ``running`` event) so extension
+        reading-time pacing before work does not consume the CLI budget.
+        Claimed-but-not-running gets a 180s grace for that pacing dwell.
+        """
+        if cmd.started_at is not None:
+            return self._now() - cmd.started_at
+        if cmd.status == CommandStatus.CLAIMED:
+            return max(0.0, self._now() - cmd.created_at - 180.0)
+        return self._now() - cmd.created_at
+
     def _reap_stale_commands(self) -> None:
         """Mark timed-out commands and free busy browsers (even if no client is waiting)."""
         now = self._now()
         for cmd in list(self._commands.values()):
             if cmd.status in TERMINAL:
                 continue
-            if now - cmd.created_at < cmd.timeout_s:
+            # Pending/claimed-but-not-running: still use created_at so abandoned
+            # commands don't sit forever; once started_at is set, pacing is excluded.
+            if self._cmd_age_s(cmd) < cmd.timeout_s:
                 continue
-            cmd.status = "timeout"
+            cmd.status = CommandStatus.TIMEOUT
             cmd.error = "command timed out"
             cmd.result = {"error": "command timed out"}
             cmd.events.append(
                 {
                     "seq": len(cmd.events) + 1,
-                    "type": "timeout",
+                    "type": EventType.TIMEOUT,
                     "payload": cmd.result,
                     "ts": time.time(),
                 }
@@ -287,7 +315,7 @@ class ExtBroker:
                         continue
                     rows.append(
                         {
-                            "source": "cache",
+                            "source": SearchSource.CACHE,
                             "conversation_id": cid,
                             "title": title,
                             "role": role,
@@ -304,7 +332,7 @@ class ExtBroker:
                         continue
                     rows.append(
                         {
-                            "source": "cache",
+                            "source": SearchSource.CACHE,
                             "conversation_id": cid,
                             "title": title,
                             "role": "unknown",
@@ -323,7 +351,7 @@ class ExtBroker:
                 continue
             hits.append(
                 {
-                    "source": "cache",
+                    "source": SearchSource.CACHE,
                     "conversation_id": cid,
                     "title": title,
                     "path": d.get("path"),
@@ -335,197 +363,226 @@ class ExtBroker:
 
     async def enqueue(self, kind: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         params = dict(params or {})
-        kind = kind.strip().lower().replace("_", "-")
+        kind = normalize_command_kind(kind)
         raw_timeout = params.pop("timeout_s", None)
         if raw_timeout is None:
             raw_timeout = params.pop("timeout", None)
         # page-html defaults to a short timeout when unspecified
-        if raw_timeout is None and kind == "page-html":
+        if raw_timeout is None and kind == CommandKind.PAGE_HTML:
             timeout_s = clamp_timeout(60)
         else:
             timeout_s = clamp_timeout(raw_timeout)
         browser_id = params.pop("browser_id", None)
         account = params.pop("account", None)
 
-        if kind == "query":
-            model = params.get("model")
-            effort = params.get("effort")
-            if model and ":" in str(model) and not effort:
-                m, e = parse_model_spec(str(model))
-                params["model"] = m
-                params["effort"] = e
-            elif model and not effort:
-                params["effort"] = "medium"
-            target = self._pick_browser(
-                browser_id=browser_id,
-                account=account,
-                conversation_id=params.get("conversation_id"),
-            )
-            if browser_id and not target:
-                raise ValueError(f"browser not connected: {browser_id}")
-            if not target and not self.live_browsers():
-                raise ValueError("no extension browsers connected")
-            cmd = Command(
-                id=str(uuid.uuid4()),
-                kind=kind,
-                params=params,
-                timeout_s=timeout_s,
-                target_browser_id=target or browser_id,
-                target_account=account,
-            )
-            async with self._lock:
-                self._commands[cmd.id] = cmd
-                await self._pending.put(cmd.id)
-                self._wake_pollers()
-            log.info(
-                "command queued id=%s kind=%s target=%s",
-                cmd.id[:8],
-                kind,
-                (cmd.target_browser_id or "-")[:8],
-            )
-            return self._cmd_public(cmd)
-
-        if kind in ("list-models", "page-html"):
-            if kind == "page-html" and params.get("max_chars") is None:
-                params["max_chars"] = 200_000
-            target = self._pick_browser(
-                browser_id=browser_id,
-                account=account,
-                conversation_id=params.get("conversation_id"),
-            )
-            if not target and not self.live_browsers():
-                raise ValueError("no extension browsers connected")
-            cmd = Command(
-                id=str(uuid.uuid4()),
-                kind=kind,
-                params=params,
-                timeout_s=timeout_s,
-                target_browser_id=target or browser_id,
-                target_account=account,
-            )
-            async with self._lock:
-                self._commands[cmd.id] = cmd
-                await self._pending.put(cmd.id)
-                self._wake_pollers()
-            log.info(
-                "command queued id=%s kind=%s target=%s",
-                cmd.id[:8],
-                kind,
-                (cmd.target_browser_id or "-")[:8],
-            )
-            return self._cmd_public(cmd)
-
-        if kind == "search":
-            sources = params.get("sources") or ["cache", "gemini-live"]
-            if isinstance(sources, str):
-                sources = [sources]
-            sources = [str(s).strip().lower() for s in sources]
-            params["sources"] = sources
-            limit = int(params.get("limit") or 20)
-            offset = int(params.get("offset") or 0)
-            query = params.get("query") or params.get("q")
-            conversation_id = params.get("conversation_id")
-
-            cache_hits: list[dict[str, Any]] = []
-            if "cache" in sources:
-                cache_hits = self.cache_search(
-                    query=query,
-                    conversation_id=conversation_id,
-                    limit=limit,
-                    offset=offset,
+        match kind:
+            case CommandKind.QUERY:
+                model = params.get("model")
+                effort = params.get("effort")
+                if model and ":" in str(model) and not effort:
+                    m, e = parse_model_spec(str(model))
+                    params["model"] = m
+                    params["effort"] = e
+                elif model and not effort:
+                    params["effort"] = Effort.MEDIUM
+                target = self._pick_browser(
+                    browser_id=browser_id,
+                    account=account,
+                    conversation_id=params.get("conversation_id"),
                 )
-
-            need_live = "gemini-live" in sources
-            self._prune_browsers()
-            live = list(self._browsers.values())
-            if account:
-                live = [b for b in live if (b.account or "").lower() == account.lower()]
-            if browser_id:
-                live = [b for b in live if b.browser_id == browser_id]
-
-            if not need_live:
+                if browser_id and not target:
+                    raise ValueError(f"browser not connected: {browser_id}")
+                if not target and not self.live_browsers():
+                    raise ValueError("no extension browsers connected")
                 cmd = Command(
                     id=str(uuid.uuid4()),
                     kind=kind,
                     params=params,
                     timeout_s=timeout_s,
-                    status="done",
-                    result={"hits": cache_hits, "sources": sources},
+                    target_browser_id=target or browser_id,
+                    target_account=account,
+                )
+                async with self._lock:
+                    self._commands[cmd.id] = cmd
+                    await self._pending.put(cmd.id)
+                    self._wake_pollers()
+                log.info(
+                    "command queued id=%s kind=%s target=%s",
+                    cmd.id[:8],
+                    kind,
+                    (cmd.target_browser_id or "-")[:8],
+                )
+                return self._cmd_public(cmd)
+
+            case CommandKind.LIST_MODELS | CommandKind.PAGE_HTML:
+                if kind == CommandKind.PAGE_HTML and params.get("max_chars") is None:
+                    params["max_chars"] = 200_000
+                target = self._pick_browser(
+                    browser_id=browser_id,
+                    account=account,
+                    conversation_id=params.get("conversation_id"),
+                )
+                if not target and not self.live_browsers():
+                    raise ValueError("no extension browsers connected")
+                cmd = Command(
+                    id=str(uuid.uuid4()),
+                    kind=kind,
+                    params=params,
+                    timeout_s=timeout_s,
+                    target_browser_id=target or browser_id,
+                    target_account=account,
+                )
+                async with self._lock:
+                    self._commands[cmd.id] = cmd
+                    await self._pending.put(cmd.id)
+                    self._wake_pollers()
+                log.info(
+                    "command queued id=%s kind=%s target=%s",
+                    cmd.id[:8],
+                    kind,
+                    (cmd.target_browser_id or "-")[:8],
+                )
+                return self._cmd_public(cmd)
+
+            case CommandKind.SEARCH:
+                return await self._enqueue_search(
+                    params,
+                    timeout_s=timeout_s,
+                    browser_id=browser_id,
+                    account=account,
+                )
+
+            case _:
+                raise ValueError(f"unknown command kind: {kind}")
+
+    async def _enqueue_search(
+        self,
+        params: dict[str, Any],
+        *,
+        timeout_s: int,
+        browser_id: str | None,
+        account: str | None,
+    ) -> dict[str, Any]:
+        kind = CommandKind.SEARCH
+        sources = params.get("sources") or [SearchSource.CACHE, SearchSource.GEMINI_LIVE]
+        if isinstance(sources, str):
+            sources = [sources]
+        sources = [str(s).strip().lower() for s in sources]
+        params["sources"] = sources
+        limit = int(params.get("limit") or 20)
+        offset = int(params.get("offset") or 0)
+        query = params.get("query") or params.get("q")
+        conversation_id = params.get("conversation_id")
+
+        cache_hits: list[dict[str, Any]] = []
+        if SearchSource.CACHE in sources:
+            cache_hits = self.cache_search(
+                query=query,
+                conversation_id=conversation_id,
+                limit=limit,
+                offset=offset,
+            )
+
+        need_live = SearchSource.GEMINI_LIVE in sources
+        self._prune_browsers()
+        live = list(self._browsers.values())
+        if account:
+            live = [b for b in live if (b.account or "").lower() == account.lower()]
+        if browser_id:
+            live = [b for b in live if b.browser_id == browser_id]
+
+        if not need_live:
+            cmd = Command(
+                id=str(uuid.uuid4()),
+                kind=kind,
+                params=params,
+                timeout_s=timeout_s,
+                status=CommandStatus.DONE,
+                result={"hits": cache_hits, "sources": sources},
+                sources_cache_hits=cache_hits,
+            )
+            cmd.events.append(
+                {
+                    "seq": 1,
+                    "type": EventType.DONE,
+                    "payload": cmd.result,
+                    "ts": time.time(),
+                }
+            )
+            cmd.wake.set()
+            async with self._lock:
+                self._commands[cmd.id] = cmd
+            return self._cmd_public(cmd)
+
+        if not live:
+            if cache_hits:
+                cmd = Command(
+                    id=str(uuid.uuid4()),
+                    kind=kind,
+                    params=params,
+                    timeout_s=timeout_s,
+                    status=CommandStatus.DONE,
+                    result={
+                        "hits": cache_hits,
+                        "sources": sources,
+                        "warning": "no live browsers; cache only",
+                    },
                     sources_cache_hits=cache_hits,
                 )
                 cmd.events.append(
-                    {"seq": 1, "type": "done", "payload": cmd.result, "ts": time.time()}
+                    {
+                        "seq": 1,
+                        "type": EventType.DONE,
+                        "payload": cmd.result,
+                        "ts": time.time(),
+                    }
                 )
                 cmd.wake.set()
                 async with self._lock:
                     self._commands[cmd.id] = cmd
                 return self._cmd_public(cmd)
+            raise ValueError("no extension browsers connected for gemini-live search")
 
-            if not live:
-                if cache_hits:
-                    cmd = Command(
-                        id=str(uuid.uuid4()),
-                        kind=kind,
-                        params=params,
-                        timeout_s=timeout_s,
-                        status="done",
-                        result={
-                            "hits": cache_hits,
-                            "sources": sources,
-                            "warning": "no live browsers; cache only",
-                        },
-                        sources_cache_hits=cache_hits,
-                    )
-                    cmd.events.append(
-                        {"seq": 1, "type": "done", "payload": cmd.result, "ts": time.time()}
-                    )
-                    cmd.wake.set()
-                    async with self._lock:
-                        self._commands[cmd.id] = cmd
-                    return self._cmd_public(cmd)
-                raise ValueError("no extension browsers connected for gemini-live search")
-
-            parent = Command(
+        parent = Command(
+            id=str(uuid.uuid4()),
+            kind=kind,
+            params=params,
+            timeout_s=timeout_s,
+            status=CommandStatus.RUNNING,
+            sources_cache_hits=cache_hits,
+            target_account=account,
+        )
+        children: list[Command] = []
+        for b in live:
+            child = Command(
                 id=str(uuid.uuid4()),
-                kind=kind,
-                params=params,
+                kind=CommandKind.SEARCH,
+                params={
+                    **params,
+                    "sources": [SearchSource.GEMINI_LIVE],
+                    "_fanout": True,
+                },
                 timeout_s=timeout_s,
-                status="running",
-                sources_cache_hits=cache_hits,
-                target_account=account,
+                target_browser_id=b.browser_id,
+                parent_id=parent.id,
             )
-            children: list[Command] = []
-            for b in live:
-                child = Command(
-                    id=str(uuid.uuid4()),
-                    kind="search",
-                    params={
-                        **params,
-                        "sources": ["gemini-live"],
-                        "_fanout": True,
-                    },
-                    timeout_s=timeout_s,
-                    target_browser_id=b.browser_id,
-                    parent_id=parent.id,
-                )
-                children.append(child)
-                parent.child_ids.append(child.id)
+            children.append(child)
+            parent.child_ids.append(child.id)
 
-            async with self._lock:
-                self._commands[parent.id] = parent
-                for child in children:
-                    self._commands[child.id] = child
-                    await self._pending.put(child.id)
-                self._wake_pollers()
-            log.info(
-                "command queued id=%s kind=search sources=%s live_browsers=%d",
-                parent.id[:8],
-                ",".join(sources),
-                len(children),
-            )
-            return self._cmd_public(parent)
-
-        raise ValueError(f"unknown command kind: {kind}")
+        async with self._lock:
+            self._commands[parent.id] = parent
+            for child in children:
+                self._commands[child.id] = child
+                await self._pending.put(child.id)
+            self._wake_pollers()
+        log.info(
+            "command queued id=%s kind=%s sources=%s live_browsers=%d",
+            parent.id[:8],
+            CommandKind.SEARCH,
+            ",".join(sources),
+            len(children),
+        )
+        return self._cmd_public(parent)
 
     async def poll(self, browser_id: str, *, wait_s: float = POLL_MAX_S) -> dict[str, Any] | None:
         await self.register(browser_id)
@@ -560,7 +617,7 @@ class ExtBroker:
             except asyncio.QueueEmpty:
                 break
             cmd = self._commands.get(cid)
-            if not cmd or cmd.status != "pending":
+            if not cmd or cmd.status != CommandStatus.PENDING:
                 continue
             if cmd.target_browser_id and cmd.target_browser_id != browser_id:
                 skipped.append(cid)
@@ -570,7 +627,7 @@ class ExtBroker:
                 if not reg or (reg.account or "").lower() != cmd.target_account.lower():
                     skipped.append(cid)
                     continue
-            cmd.status = "claimed"
+            cmd.status = CommandStatus.CLAIMED
             cmd.claimed_by = browser_id
             reg = self._browsers.get(browser_id)
             if reg:
@@ -600,6 +657,31 @@ class ExtBroker:
             cmd = self._commands.get(command_id)
             if not cmd:
                 raise KeyError(command_id)
+            # Terminal is sticky: late done/error must not reopen cancelled/timeout
+            # (or any other terminal status). Keep busy consistent with terminal.
+            status_changing = type in (
+                EventType.RUNNING,
+                EventType.CLAIMED,
+                EventType.DONE,
+                EventType.ERROR,
+                EventType.TIMEOUT,
+                EventType.CANCELLED,
+            )
+            if cmd.status in TERMINAL and status_changing:
+                if cmd.claimed_by and cmd.claimed_by in self._browsers:
+                    self._browsers[cmd.claimed_by].busy = False
+                log.info(
+                    "ignoring late %s on terminal command id=%s status=%s",
+                    type,
+                    cmd.id[:8],
+                    cmd.status,
+                )
+                return {
+                    "ignored": True,
+                    "status": cmd.status,
+                    "type": type,
+                    "payload": payload or {},
+                }
             next_seq = (cmd.events[-1]["seq"] + 1) if cmd.events else 1
             event = {
                 "seq": seq or next_seq,
@@ -608,31 +690,39 @@ class ExtBroker:
                 "ts": time.time(),
             }
             cmd.events.append(event)
-            if type in ("running", "claimed"):
-                cmd.status = "running"
-            if type in TERMINAL:
-                cmd.status = type
-                if type == "done":
-                    cmd.result = payload or {}
-                elif type in ("error", "timeout"):
-                    cmd.error = (payload or {}).get("error") or (payload or {}).get("message") or type
-                    cmd.result = payload or {}
-                if cmd.claimed_by and cmd.claimed_by in self._browsers:
-                    self._browsers[cmd.claimed_by].busy = False
-                # Merge parent search when all children terminal
-                if cmd.parent_id:
-                    await self._maybe_finish_parent(cmd.parent_id)
-                cmd.wake.set()
-                err = cmd.error or (payload or {}).get("error")
-                log.info(
-                    "command %s id=%s kind=%s%s",
-                    type,
-                    cmd.id[:8],
-                    cmd.kind,
-                    f" error={err}" if err else "",
-                )
-            elif type not in ("delta",):
-                log.info("command event id=%s type=%s", cmd.id[:8], type)
+            match type:
+                case EventType.RUNNING | EventType.CLAIMED:
+                    cmd.status = CommandStatus.RUNNING
+                    if type == EventType.RUNNING and cmd.started_at is None:
+                        cmd.started_at = self._now()
+                case EventType.DONE | EventType.ERROR | EventType.TIMEOUT | EventType.CANCELLED:
+                    cmd.status = CommandStatus(type)
+                    if type == EventType.DONE:
+                        cmd.result = payload or {}
+                    else:
+                        cmd.error = (
+                            (payload or {}).get("error")
+                            or (payload or {}).get("message")
+                            or type
+                        )
+                        cmd.result = payload or {"error": cmd.error}
+                    if cmd.claimed_by and cmd.claimed_by in self._browsers:
+                        self._browsers[cmd.claimed_by].busy = False
+                    if cmd.parent_id:
+                        await self._maybe_finish_parent(cmd.parent_id)
+                    cmd.wake.set()
+                    err = cmd.error or (payload or {}).get("error")
+                    log.info(
+                        "command %s id=%s kind=%s%s",
+                        type,
+                        cmd.id[:8],
+                        cmd.kind,
+                        f" error={err}" if err else "",
+                    )
+                case EventType.DELTA:
+                    pass
+                case _:
+                    log.info("command event id=%s type=%s", cmd.id[:8], type)
             return event
 
     async def _maybe_finish_parent(self, parent_id: str) -> None:
@@ -650,7 +740,11 @@ class ExtBroker:
         for c in children:
             live_hits = (c.result or {}).get("hits") or []
             for h in live_hits:
-                row = {**h, "source": h.get("source") or "gemini-live", "browser_id": c.claimed_by}
+                row = {
+                    **h,
+                    "source": h.get("source") or SearchSource.GEMINI_LIVE,
+                    "browser_id": c.claimed_by,
+                }
                 key = (
                     row.get("source"),
                     row.get("account"),
@@ -677,9 +771,14 @@ class ExtBroker:
             "sources": parent.params.get("sources"),
             "browsers": [c.claimed_by for c in children],
         }
-        parent.status = "done"
+        parent.status = CommandStatus.DONE
         parent.events.append(
-            {"seq": len(parent.events) + 1, "type": "done", "payload": parent.result, "ts": time.time()}
+            {
+                "seq": len(parent.events) + 1,
+                "type": EventType.DONE,
+                "payload": parent.result,
+                "ts": time.time(),
+            }
         )
         parent.wake.set()
 
@@ -689,27 +788,54 @@ class ExtBroker:
             return None
         return self._cmd_public(cmd, after_seq=after_seq)
 
+    async def cancel(self, command_id: str, *, reason: str = "cancelled by client") -> dict[str, Any]:
+        """Mark a non-terminal command cancelled and free the browser busy flag."""
+        async with self._lock:
+            cmd = self._commands.get(command_id)
+            if not cmd:
+                raise KeyError(command_id)
+            if cmd.status in TERMINAL:
+                return self._cmd_public(cmd)
+            cmd.status = CommandStatus.CANCELLED
+            cmd.error = reason
+            cmd.result = {"error": reason, "cancelled": True}
+            cmd.events.append(
+                {
+                    "seq": len(cmd.events) + 1,
+                    "type": EventType.CANCELLED,
+                    "payload": cmd.result,
+                    "ts": time.time(),
+                }
+            )
+            if cmd.claimed_by and cmd.claimed_by in self._browsers:
+                self._browsers[cmd.claimed_by].busy = False
+            if cmd.parent_id:
+                await self._maybe_finish_parent(cmd.parent_id)
+            cmd.wake.set()
+            log.info("command cancelled id=%s kind=%s", cmd.id[:8], cmd.kind)
+            return self._cmd_public(cmd)
+
     async def wait(self, command_id: str, *, timeout_s: float | None = None) -> dict[str, Any]:
         cmd = self._commands.get(command_id)
         if not cmd:
             raise KeyError(command_id)
-        # Also enforce command timeout from creation
-        remaining_cmd = cmd.timeout_s - (self._now() - cmd.created_at)
+        # Enforce command timeout from started_at (or created_at + claim grace)
+        remaining_cmd = cmd.timeout_s - self._cmd_age_s(cmd)
         wait_budget = timeout_s if timeout_s is not None else max(1.0, remaining_cmd + 5)
         wait_budget = min(wait_budget, max(1.0, remaining_cmd + 5))
 
         while cmd.status not in TERMINAL:
-            left = cmd.timeout_s - (self._now() - cmd.created_at)
+            left = cmd.timeout_s - self._cmd_age_s(cmd)
             if left <= 0:
                 async with self._lock:
                     if cmd.status not in TERMINAL:
-                        cmd.status = "timeout"
+                        cmd.status = CommandStatus.TIMEOUT
                         cmd.error = "command timed out"
                         cmd.result = {"error": "command timed out"}
                         cmd.events.append(
                             {
                                 "seq": len(cmd.events) + 1,
-                                "type": "timeout",
+                                "type": EventType.TIMEOUT,
                                 "payload": cmd.result,
                                 "ts": time.time(),
                             }
