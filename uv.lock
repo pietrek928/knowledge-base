@@ -304,6 +304,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "anyascii" },
+    { name = "click" },
     { name = "fastapi" },
     { name = "granian" },
     { name = "httpx" },
@@ -335,6 +336,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "anyascii", specifier = ">=0.3" },
+    { name = "click", specifier = ">=8.1" },
     { name = "fastapi", specifier = ">=0.115" },
     { name = "granian", specifier = ">=1.6" },
     { name = "httpx", specifier = ">=0.27" },

@@ -9,6 +9,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from knowledge_base.config import load_config
+from knowledge_base.ext_broker import ExtBroker
 from knowledge_base.service import KnowledgeBase
 
 _STATIC = Path(__file__).resolve().parent / "static"
@@ -58,15 +59,42 @@ class SearchRequest(BaseModel):
     rrf_k: int | None = None
 
 
+class ExtRegisterRequest(BaseModel):
+    browser_id: str
+    account: str | None = None
+    capabilities: list[str] | None = None
+    conversation_ids: list[str] | None = None
+
+
+class ExtHeartbeatRequest(BaseModel):
+    browser_id: str
+    account: str | None = None
+    conversation_ids: list[str] | None = None
+
+
+class ExtEventRequest(BaseModel):
+    command_id: str
+    type: str
+    payload: dict[str, Any] | None = None
+    seq: int | None = None
+
+
+class ExtCommandRequest(BaseModel):
+    kind: str
+    params: dict[str, Any] | None = None
+
+
 def create_app(cfg: dict[str, Any] | None = None, *, fake_ollama: bool | None = None) -> FastAPI:
     if fake_ollama is None:
         fake_ollama = os.environ.get("KB_FAKE_OLLAMA", "").lower() in ("1", "true", "yes")
     kb = KnowledgeBase(cfg or load_config(), fake_ollama=fake_ollama)
+    broker = ExtBroker(list_docs=kb.list_docs, get_document=kb.get_document)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         await kb.start()
         app.state.kb = kb
+        app.state.broker = broker
         yield
         await kb.stop()
 
@@ -149,6 +177,77 @@ def create_app(cfg: dict[str, Any] | None = None, *, fake_ollama: bool | None = 
     async def browse_page(doc_path: str) -> FileResponse:
         """SPA shell for path-based document browsing (client loads /docs/…)."""
         return FileResponse(_STATIC / "index.html")
+
+    # --- Extension remote-control broker ---
+
+    @app.post("/ext/register")
+    async def ext_register(req: ExtRegisterRequest) -> dict[str, Any]:
+        return await broker.register(
+            req.browser_id,
+            account=req.account,
+            capabilities=req.capabilities,
+            conversation_ids=req.conversation_ids,
+        )
+
+    @app.post("/ext/heartbeat")
+    async def ext_heartbeat(req: ExtHeartbeatRequest) -> dict[str, Any]:
+        return await broker.heartbeat(
+            req.browser_id,
+            account=req.account,
+            conversation_ids=req.conversation_ids,
+        )
+
+    @app.get("/ext/browsers")
+    async def ext_browsers() -> dict[str, Any]:
+        return {"browsers": broker.live_browsers()}
+
+    @app.get("/ext/poll")
+    async def ext_poll(
+        browser_id: str = Query(...),
+        wait_s: float = Query(25.0, ge=0.0, le=25.0),
+    ) -> Any:
+        from fastapi.responses import Response
+
+        cmd = await broker.poll(browser_id, wait_s=wait_s)
+        if cmd is None:
+            return Response(status_code=204)
+        return cmd
+
+    @app.post("/ext/events")
+    async def ext_events(req: ExtEventRequest) -> dict[str, Any]:
+        try:
+            event = await broker.post_event(
+                req.command_id, type=req.type, payload=req.payload, seq=req.seq
+            )
+            return {"ok": True, "event": event}
+        except KeyError as e:
+            raise HTTPException(404, "command not found") from e
+
+    @app.post("/ext/commands")
+    async def ext_commands(req: ExtCommandRequest) -> dict[str, Any]:
+        try:
+            return await broker.enqueue(req.kind, req.params)
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from e
+
+    @app.get("/ext/commands/{command_id}")
+    async def ext_command_get(
+        command_id: str, after_seq: int = Query(0, ge=0)
+    ) -> dict[str, Any]:
+        cmd = broker.get(command_id, after_seq=after_seq)
+        if cmd is None:
+            raise HTTPException(404, "command not found")
+        return cmd
+
+    @app.get("/ext/commands/{command_id}/wait")
+    async def ext_command_wait(
+        command_id: str,
+        timeout_s: float | None = Query(None, ge=1.0, le=650.0),
+    ) -> dict[str, Any]:
+        try:
+            return await broker.wait(command_id, timeout_s=timeout_s)
+        except KeyError as e:
+            raise HTTPException(404, "command not found") from e
 
     if _STATIC.exists():
         app.mount("/static", StaticFiles(directory=str(_STATIC)), name="static")

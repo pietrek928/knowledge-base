@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
   "name": "Gemini → Knowledge Base",
-  "version": "0.1.0",
-  "description": "Auto-save Gemini chats to a local knowledge base via private RPC.",
-  "permissions": ["storage", "alarms", "tabs", "scripting"],
+  "version": "0.3.4",
+  "description": "Auto-save Gemini chats and run remote query/search commands via a local knowledge base.",
+  "permissions": ["storage", "alarms", "tabs", "scripting", "debugger"],
   "host_permissions": [
     "https://gemini.google.com/*",
     "http://127.0.0.1:8080/*",
@@ -28,8 +28,12 @@
   },
   "content_scripts": [
     {
-      "matches": ["https://gemini.google.com/app/*"],
-      "js": ["content.js"],
+      "matches": [
+        "https://gemini.google.com/app",
+        "https://gemini.google.com/app/",
+        "https://gemini.google.com/app/*"
+      ],
+      "js": ["human.js", "gemini_models.js", "content.js"],
       "run_at": "document_idle"
     }
   ]

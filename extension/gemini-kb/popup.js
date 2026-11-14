@@ -1,13 +1,14 @@
 const kbUrlEl = document.getElementById("kbUrl");
 const autoSaveEl = document.getElementById("autoSave");
+const trustedInputEl = document.getElementById("trustedInput");
 const statusEl = document.getElementById("status");
 const listEl = document.getElementById("list");
 
-function setStatus(text) {
+const setStatus = (text) => {
   statusEl.textContent = text || "";
-}
+};
 
-function renderChats(chats) {
+const renderChats = (chats) => {
   const items = Object.values(chats || {}).sort((a, b) =>
     String(b.lastCheckedAt || "").localeCompare(String(a.lastCheckedAt || ""))
   );
@@ -29,17 +30,17 @@ function renderChats(chats) {
       )}${pending}</div><div>${escapeHtml(pushed)}</div></div>`;
     })
     .join("");
-}
+};
 
-function escapeHtml(s) {
+const escapeHtml = (s) => {
   return String(s)
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
-}
+};
 
-function refresh() {
+const refresh = () => {
   chrome.runtime.sendMessage({ type: "get_state" }, (state) => {
     if (!state) {
       setStatus("Background unavailable");
@@ -47,14 +48,20 @@ function refresh() {
     }
     kbUrlEl.value = state.kbUrl || "";
     autoSaveEl.checked = !!state.autoSave;
+    trustedInputEl.checked = !!state.trustedInput;
     const n = Object.keys(state.chats || {}).length;
     const pending = Object.values(state.chats || {}).filter(
       (c) => c.pendingFullSync
     ).length;
-    setStatus(`Tracked: ${n}${pending ? ` · pending: ${pending}` : ""}`);
+    let status = `Tracked: ${n}${pending ? ` · pending: ${pending}` : ""}`;
+    if (state.captchaNeedsUser || (state.captchaBlockedUntil || 0) > Date.now()) {
+      status += " · captcha gate (cleared on popup open)";
+      chrome.runtime.sendMessage({ type: "clear_captcha_gate" });
+    }
+    setStatus(status);
     renderChats(state.chats);
   });
-}
+};
 
 document.getElementById("saveSettings").addEventListener("click", () => {
   chrome.runtime.sendMessage(
@@ -62,9 +69,14 @@ document.getElementById("saveSettings").addEventListener("click", () => {
       type: "set_settings",
       kbUrl: kbUrlEl.value.trim(),
       autoSave: autoSaveEl.checked,
+      trustedInput: trustedInputEl.checked,
     },
     () => {
-      setStatus("Settings saved");
+      setStatus(
+        trustedInputEl.checked
+          ? "Saved — debugger input ON (banner may appear)"
+          : "Saved — synthetic input (default)"
+      );
       refresh();
     }
   );

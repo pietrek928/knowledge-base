@@ -59,6 +59,7 @@ Open http://127.0.0.1:8080/
 - `POST /search` — JSON body with `phrases`, `limit`, fusion/weights, date/meta filters, sibling boosts, …
 - `GET /search?q=…` — flat alias
 - `GET /health`
+- `/ext/*` — extension remote-control broker (register, poll, events, commands, wait, browsers)
 
 OpenAPI UI: `/api/docs`
 
@@ -93,13 +94,38 @@ Document embeds run **one model at a time**. If Takeout hits `ReadTimeout`, rais
 
 ### Extension (Chrome / Brave)
 
-Load unpacked from [`extension/gemini-kb/`](extension/gemini-kb/):
+Load unpacked from [`extension/gemini-kb/`](extension/gemini-kb/) (v0.3.1+):
 
 1. Start the KB: `uv run kb serve --host 127.0.0.1 --port 8080`
-2. Chrome `chrome://extensions` or Brave `brave://extensions` → Developer mode → **Load unpacked** → select `extension/gemini-kb`
+2. Chrome `chrome://extensions` or Brave `brave://extensions` → Developer mode → **Load unpacked** → select `extension/gemini-kb` (reload after updates)
 3. Open the popup: set KB URL (`http://127.0.0.1:8080`), enable **Auto-save while browsing**
 4. Visit `https://gemini.google.com/app/<id>` — the extension paginates private `hNvQHb` RPC and `POST`s structured turns to `/ingest/gemini` (no public share links)
 5. Weekly alarm re-syncs chats that were never pushed, marked `pendingFullSync`, or last pushed &gt; 7 days ago
+
+### Remote control (`kb-cli`)
+
+With the extension loaded and `kb serve` running, the extension **registers**, **heartbeats**, and **long-polls** `/ext/*` for commands. Drive it from a second Click entrypoint:
+
+```bash
+uv run kb-cli browsers
+uv run kb-cli list-models
+uv run kb-cli list-models --conversation-id <id>   # profile-scoped picker
+uv run kb-cli page-html -o /tmp/gemini.html
+uv run kb-cli page-html --selector 'button[aria-label*="model" i]' --max-chars 50000
+uv run kb-cli list-models   # use exact labels Gemini shows (e.g. Argon:high)
+uv run kb-cli query "explain batch_size" --model Argon:high
+uv run kb-cli query "follow-up" --conversation-id <id>
+uv run kb-cli search -q Parallel --source cache --source gemini-live
+uv run kb-cli search --conversation-id <id> -q batch_size --source cache
+```
+
+- **`query`**: opens/reuses a Gemini tab, optionally selects model/effort, types with humanized timing, waits for generation (timeout), streams JSON events, and **ingests** the thread. If Gemini auto-switches models (quota), a `model_changed` event is emitted.
+- **`search`**: without `--conversation-id` returns conversation hits; with it, message hits. `--source cache` reads the KB store; `gemini-live` fans out to connected browsers (merged by account).
+- **`page-html`**: dumps live page HTML for debugging (`--selector`, `--max-chars`, `-o` to write the body to a file).
+- Multiple browsers: `kb-cli browsers` lists them; pass `--browser-id` / `--account` to route. Live search merges all accounts.
+- Extension uses synthetic humanized typing/clicks by default (no debugger banner). Optional **Trusted input** in the popup enables `chrome.debugger` (better `isTrusted`, but shows a banner and can trip anti-bot). Also: reading-time pacing, DOM-first extract, exponential captcha backoff (open the popup after `/sorry` to clear the gate).
+
+Broker HTTP: `/ext/register`, `/ext/poll`, `/ext/events`, `/ext/commands`, `/ext/commands/{id}/wait`, `/ext/browsers`.
 
 ## Ollama CPU usage
 
