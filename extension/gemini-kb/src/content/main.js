@@ -23,11 +23,7 @@ const CONTENT_HASH =
 
 const PAGE_SIZE = 10;
 const MAX_RPC_PAGES = 8;
-const gSleep = (mean, sigma, min, max) => {
-  const ms = gaussMs(mean, sigma, min, max);
-  if (H?.sleep) return H.sleep(ms);
-  return new Promise((r) => setTimeout(r, ms));
-};
+const gSleep = (mean, sigma, min, max) => H.sleep(gaussMs(mean, sigma, min, max));
 
 let debounceTimer = null;
 let lastAttemptAt = 0;
@@ -529,7 +525,7 @@ const fetchPage = async (conversationId, cursor, runtime) => {
   );
   if (!res.ok) throw new Error(`batchexecute HTTP ${res.status}`);
   // Seconds between pages — never hammer the private RPC.
-  if (H?.sleep) await H.sleep(H.gaussianDelay(2200, 500, 1200, 4000));
+  await gSleep(2200, 500, 1200, 4000);
   return parseBatchexecute(await res.text());
 };
 
@@ -714,7 +710,6 @@ const latestModelResponseEl = () => {
 
 const readLastReplyHuman = async ({ reason } = {}) => {
   try {
-      if (typeof H?.humanScroll !== "function") return;
     const el = latestModelResponseEl();
     if (!el) return;
     const vh = window.innerHeight;
@@ -729,8 +724,7 @@ const readLastReplyHuman = async ({ reason } = {}) => {
     }
 
     if (reason === "post_extract") {
-      if (H?.betweenActions) await H.betweenActions();
-      else await gSleep(140, 45, 70, 240);
+      await H.betweenActions();
       if (rect.bottom > vh * 0.85) {
         const delta = Math.round(gaussMs(260, 70, 140, 420));
         await H.humanScroll(delta);
@@ -739,9 +733,8 @@ const readLastReplyHuman = async ({ reason } = {}) => {
     }
 
     // post_done (default)
-    if (H?.betweenActions) await H.betweenActions();
-    else await gSleep(140, 45, 70, 240);
-    if (typeof H.scrollIntoViewHuman === "function") await H.scrollIntoViewHuman(el);
+    await H.betweenActions();
+    await H.scrollIntoViewHuman(el);
     const after = el.getBoundingClientRect();
     if (after.height > vh * 0.7 && after.bottom > vh * 0.9) {
       const delta = Math.round(gaussMs(340, 90, 180, 520));
@@ -1114,13 +1107,11 @@ const remoteQuery = async (params, emit) => {
   throwIfRemoteAborted();
   const composer = findComposer();
   if (!composer) {
-    if (params.debug && typeof Models.failWithDebug === "function") {
-      throw Models.failWithDebug("composer not found", "composer_not_found");
-    }
+    if (params.debug) throw Models.failWithDebug("composer not found", "composer_not_found");
     throw new Error("composer not found");
   }
   // Brief settle / pointer wander before first keystroke after navigation.
-  await H.sleep(H.gaussianDelay(1800, 400, 1200, 3200));
+  await gSleep(1800, 400, 1200, 3200);
   throwIfRemoteAborted();
   try {
     await H.wanderPointer();
@@ -1135,7 +1126,7 @@ const remoteQuery = async (params, emit) => {
     await H.humanType(composer, text);
   } catch (err) {
     if (err?.cancelled || err?.aborted) throw err;
-    if (params.debug && typeof Models.failWithDebug === "function") {
+    if (params.debug) {
       throw Models.failWithDebug(
         String(err?.message ?? err),
         err?.composeFailed ? "compose_failed" : "compose_error"
@@ -1145,11 +1136,9 @@ const remoteQuery = async (params, emit) => {
   }
   throwIfRemoteAborted();
   await emit(EventType.DELTA, { composing: true, response_len: 0 });
-  if (typeof H.composerHasPrompt === "function" && !H.composerHasPrompt(composer, text)) {
+  if (!H.composerHasPrompt(composer, text)) {
     const msg = "composer does not contain full prompt; refusing to send";
-    if (params.debug && typeof Models.failWithDebug === "function") {
-      throw Models.failWithDebug(msg, "compose_failed");
-    }
+    if (params.debug) throw Models.failWithDebug(msg, "compose_failed");
     throw new Error(msg);
   }
   await H.betweenActions();
@@ -1165,12 +1154,7 @@ const remoteQuery = async (params, emit) => {
     if (!snapBefore.generating && isGenerating()) return true;
     if (responseTextLen() > snapBefore.responseLen) return true;
     if (userQueryCount() > snapBefore.userQueries) return true;
-    if (
-      typeof H.composerHasPrompt === "function" &&
-      !H.composerHasPrompt(composer, text)
-    ) {
-      return true;
-    }
+    if (!H.composerHasPrompt(composer, text)) return true;
     return false;
   };
   const pollSubmitStart = async (deadlineMs) => {
@@ -1183,16 +1167,21 @@ const remoteQuery = async (params, emit) => {
     return submitStarted();
   };
 
+  // Gemini often will not start generation until the tab is focused.
+  await H.focusTab();
+  try {
+    composer.focus();
+  } catch {
+    /* ignore */
+  }
+
   // Enter first (CDP via always-KEY). Do not wait on Send before Enter.
   await H.humanKey(composer, "Enter", { requireCdp: true });
   let started = await pollSubmitStart(gaussMs(2800, 400, 2000, 3500));
 
   // One forced CDP Send click if Enter did not start and prompt still sits.
-  if (
-    !started &&
-    typeof H.composerHasPrompt === "function" &&
-    H.composerHasPrompt(composer, text)
-  ) {
+  if (!started && H.composerHasPrompt(composer, text)) {
+    await H.focusTab();
     const send = findSendButton();
     if (send) {
       await H.humanClick(send, { forceCdp: true });
@@ -1202,9 +1191,7 @@ const remoteQuery = async (params, emit) => {
 
   if (!started) {
     const msg = "submit not accepted";
-    if (params.debug && typeof Models.failWithDebug === "function") {
-      throw Models.failWithDebug(msg, "submit_failed");
-    }
+    if (params.debug) throw Models.failWithDebug(msg, "submit_failed");
     throw new Error(msg);
   }
 
@@ -1234,21 +1221,10 @@ const remoteQuery = async (params, emit) => {
   const afterLabel = Models.readActiveModelLabel();
   // Honest mismatch: requested label vs live chip (not merely pre/post select).
   // Empty chip with a request is not a match — treat as unreadable / changed.
-  const matchFn =
-    typeof Models.chipMatches === "function"
-      ? Models.chipMatches
-      : typeof Models.modelMatches === "function"
-        ? Models.modelMatches
-        : null;
   const chipUnreadable = !!(modelRequested && !afterLabel);
   const matchesRequested =
     !modelRequested ||
-    (!!afterLabel &&
-      (matchFn
-        ? matchFn(afterLabel, modelRequested)
-        : String(afterLabel)
-            .toLowerCase()
-            .includes(String(modelRequested).toLowerCase().slice(0, 6))));
+    (!!afterLabel && Models.chipMatches(afterLabel, modelRequested));
   const modelChanged = !!(modelRequested && !matchesRequested);
 
   if (modelChanged) {

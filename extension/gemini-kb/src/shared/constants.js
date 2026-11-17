@@ -81,6 +81,7 @@ const freeze = (o) => Object.freeze(o);
 
   const MsgType = freeze({
     TRUSTED_INPUT: "kb_trusted_input",
+    FOCUS_TAB: "kb_focus_tab",
     PING: "kb_ping",
     REMOTE: "kb_remote",
     REMOTE_EVENT: "kb_remote_event",

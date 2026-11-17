@@ -14,7 +14,7 @@ def main(ctx: click.Context) -> None:
 
 @main.command("serve")
 @click.option("--host", default="127.0.0.1", show_default=True)
-@click.option("--port", default=8080, show_default=True, type=int)
+@click.option("--port", default=9099, show_default=True, type=int)
 @click.option("--config", default=None, type=click.Path(exists=True, dir_okay=False))
 @click.option("--fake-ollama", is_flag=True, help="Use fake embeddings (tests / no Ollama).")
 @click.option(

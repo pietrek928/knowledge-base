@@ -21,7 +21,7 @@ from knowledge_base.ext_protocol import (
     SearchSource,
 )
 
-DEFAULT_URL = "http://127.0.0.1:8080"
+DEFAULT_URL = "http://127.0.0.1:9099"
 TERMINAL = TERMINAL_STATUSES
 _FAIL_STATUSES = frozenset(
     {CommandStatus.ERROR, CommandStatus.TIMEOUT, CommandStatus.CANCELLED}

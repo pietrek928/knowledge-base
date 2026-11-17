@@ -44,12 +44,12 @@ clang-format -i src/kb_native/**/*.{cpp,hpp}
 ## Run
 
 ```bash
-uv run kb serve --host 127.0.0.1 --port 8080
+uv run kb serve --host 127.0.0.1 --port 9099
 # without Ollama:
 uv run kb serve --fake-ollama
 ```
 
-Open http://127.0.0.1:8080/
+Open http://127.0.0.1:9099/
 
 ## API
 
@@ -103,9 +103,9 @@ npm run build          # production bundles → dist/
 # npm run dev          # watch + WebSocket chrome.runtime.reload() on :9333
 ```
 
-1. Start the KB: `uv run kb serve --host 127.0.0.1 --port 8080`
+1. Start the KB: `uv run kb serve --host 127.0.0.1 --port 9099`
 2. Chrome `chrome://extensions` or Brave `brave://extensions` → Developer mode → **Load unpacked** → select `extension/gemini-kb/dist` (use `npm run build` or `npm run dev` after source edits)
-3. Open the popup: set KB URL (`http://127.0.0.1:8080`), enable **Auto-save while browsing**
+3. Open the popup: set KB URL (`http://127.0.0.1:9099`), enable **Auto-save while browsing**
 4. Visit `https://gemini.google.com/app/<id>` — the extension paginates private `hNvQHb` RPC and `POST`s structured turns to `/ingest/gemini` (no public share links)
 5. Weekly alarm re-syncs chats that were never pushed, marked `pendingFullSync`, or last pushed &gt; 7 days ago
 
@@ -177,15 +177,18 @@ sudo systemctl daemon-reload && sudo systemctl restart ollama
 
 This KB sends `options.num_thread` on every `/api/embed` call (default: logical CPUs ÷ 2). Override with `ollama.num_thread` or per-model `models[].num_thread` in `config.json`. systemd `OLLAMA_NUM_THREADS` is often ignored by the runner.
 
-## systemd
+## systemd (user)
 
-See `deploy/knowledge-base.service`. Enable with:
+Unit: [`deploy/knowledge-base.service`](deploy/knowledge-base.service) — `kb serve` on `127.0.0.1:9099`.
 
 ```bash
 mkdir -p ~/.config/systemd/user
 cp deploy/knowledge-base.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now knowledge-base.service
+# Optional: keep the user manager after logout (boot-start without a GUI session)
+loginctl enable-linger "$USER"
+systemctl --user status knowledge-base.service
 ```
 
 ## Config

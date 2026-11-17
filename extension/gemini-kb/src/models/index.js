@@ -1,8 +1,8 @@
 /**
  * Gemini model / effort picker helpers (DOM-fragile; shared scrape + select).
  */
-import * as Hns from "../human/index.js";
-import { Effort, EventType, gaussMs } from "../shared/constants.js";
+import * as H from "../human/index.js";
+import { Effort, EventType } from "../shared/constants.js";
 import {
   slugify,
   modelCoreTokens,
@@ -19,12 +19,6 @@ import {
   EFFORT_EXACT_RE,
   DEFAULT_EFFORT,
 } from "./chip.js";
-
-const H = () => Hns;
-const gDelay = (mean, sigma, min, max) =>
-  typeof gaussMs === "function"
-    ? gaussMs(mean, sigma, min, max)
-    : Math.max(min, Math.min(max, Math.round(mean)));
 
 const capturePageDebugHtml = () =>
   String(document.documentElement?.outerHTML || document.body?.outerHTML || "");
@@ -118,14 +112,8 @@ const capturePageDebugHtml = () =>
   const dismissUnlockPopup = async () => {
     const pop = findUnlockPopup();
     if (!pop) return false;
-    if (typeof H().humanKey === "function") {
-      await H().humanKey(document.activeElement || document.body, "Escape");
-    } else {
-      document.dispatchEvent(
-        new KeyboardEvent("keydown", { key: "Escape", code: "Escape", bubbles: true })
-      );
-    }
-    await H().sleep(H().gaussianDelay(200, 50, 100, 400));
+    await H.humanKey(document.activeElement || document.body, "Escape");
+    await H.sleep(H.gaussianDelay(200, 50, 100, 400));
     // Click outside / close if still open
     if (findUnlockPopup()) {
       const close =
@@ -134,7 +122,7 @@ const capturePageDebugHtml = () =>
         ) || null;
       if (close) {
         try {
-          await H().humanClick(close);
+          await H.humanClick(close);
         } catch {
           /* ignore */
         }
@@ -294,41 +282,31 @@ const capturePageDebugHtml = () =>
     const isOpen = () =>
       trig.getAttribute("aria-expanded") === "true" || menuItems().length > 0;
     if (!isOpen()) {
-      await H().humanClick(trig);
-      await H().betweenActions();
+      await H.humanClick(trig);
+      await H.betweenActions();
     }
     // Wait for panel; only re-click if still closed (re-click would toggle close).
     for (let i = 0; i < 6 && !menuItems().length; i++) {
-      await H().sleep(H().gaussianDelay(220, 40, 120, 400));
+      await H.sleep(H.gaussianDelay(220, 40, 120, 400));
       if (isOpen() && menuItems().length) break;
       if (!isOpen()) {
-        await H().humanClick(trig);
-        await H().betweenActions();
+        await H.humanClick(trig);
+        await H.betweenActions();
       }
     }
     return trig;
   };
 
   const closePicker = async () => {
-    if (typeof H().humanKey === "function") {
-      await H().humanKey(document.activeElement || document.body, "Escape");
-    } else {
-      document.dispatchEvent(
-        new KeyboardEvent("keydown", { key: "Escape", code: "Escape", bubbles: true })
-      );
-      await H().sleep(gDelay(45, 12, 20, 90));
-      document.dispatchEvent(
-        new KeyboardEvent("keyup", { key: "Escape", code: "Escape", bubbles: true })
-      );
-    }
-    await H().sleep(H().gaussianDelay(200, 50, 100, 400));
+    await H.humanKey(document.activeElement || document.body, "Escape");
+    await H.sleep(H.gaussianDelay(200, 50, 100, 400));
   };
 
   const waitForMenuItems = async (tries = 8) => {
     for (let i = 0; i < tries; i++) {
       const items = menuItems().filter((i) => !i.locked && !isJunkChromeLabel(i.label));
       if (items.length) return items;
-      await H().sleep(H().gaussianDelay(200, 40, 120, 350));
+      await H.sleep(H.gaussianDelay(200, 40, 120, 350));
     }
     return [];
   };
@@ -622,7 +600,7 @@ const capturePageDebugHtml = () =>
     if (rows.length) return rows;
     if (!pickerIsOpen()) {
       await openPicker();
-      await H().sleep(H().gaussianDelay(220, 50, 120, 400));
+      await H.sleep(H.gaussianDelay(220, 50, 120, 400));
       rows = collectStrictEffortRows(allMenuItemsMerged());
       if (rows.length) return rows;
     }
@@ -634,7 +612,7 @@ const capturePageDebugHtml = () =>
       throwIfAborted();
       rows = collectStrictEffortRows(allMenuItemsMerged());
       if (rows.length) break;
-      await H().sleep(H().gaussianDelay(200, 40, 100, 350));
+      await H.sleep(H.gaussianDelay(200, 40, 100, 350));
     }
     return rows;
   };
@@ -660,7 +638,7 @@ const capturePageDebugHtml = () =>
         prevLen = -1;
         streak = 0;
       }
-      await H().sleep(H().gaussianDelay(160, 40, 80, 280));
+      await H.sleep(H.gaussianDelay(160, 40, 80, 280));
     }
     return collectStrictEffortRows(allMenuItemsMerged());
   };
@@ -694,9 +672,9 @@ const capturePageDebugHtml = () =>
       if (!modelItem || modelItem.locked || isEffectivelyLocked(modelItem.el)) {
         return result;
       }
-      await H().humanClick(clickableMenuEl(modelItem.el));
-      await H().betweenActions();
-      await H().sleep(H().gaussianDelay(220, 50, 120, 400));
+      await H.humanClick(clickableMenuEl(modelItem.el));
+      await H.betweenActions();
+      await H.sleep(H.gaussianDelay(220, 50, 120, 400));
       if (findUnlockPopup()) {
         await dismissUnlockPopup();
         return result;
@@ -704,7 +682,7 @@ const capturePageDebugHtml = () =>
 
       let effortRows = await waitEffortRowsStable();
       result.seen = effortRows.map((i) => i.label);
-      const highRow = effortRows.find((i) => matchWantEffort(i, Effort?.HIGH || "high"));
+      const highRow = effortRows.find((i) => matchWantEffort(i, Effort.HIGH));
       if (highRow) {
         // Visible unlocked High — advertise without clicking when possible.
         result.high = true;
@@ -726,9 +704,9 @@ const capturePageDebugHtml = () =>
       );
       if (!anyHighish) return result;
 
-      await H().humanClick(clickableMenuEl(anyHighish.el));
-      await H().betweenActions();
-      await H().sleep(H().gaussianDelay(200, 40, 100, 350));
+      await H.humanClick(clickableMenuEl(anyHighish.el));
+      await H.betweenActions();
+      await H.sleep(H.gaussianDelay(200, 40, 100, 350));
       if (findUnlockPopup()) {
         await dismissUnlockPopup();
         return result;
@@ -742,12 +720,12 @@ const capturePageDebugHtml = () =>
         const rows = await waitEffortRowsStable();
         const prior = rows.find((i) => matchWantEffort(i, priorTok));
         if (prior) {
-          await H().humanClick(clickableMenuEl(prior.el));
-          await H().betweenActions();
+          await H.humanClick(clickableMenuEl(prior.el));
+          await H.betweenActions();
           restored = true;
           break;
         }
-        await H().sleep(H().gaussianDelay(180, 40, 90, 320));
+        await H.sleep(H.gaussianDelay(180, 40, 90, 320));
       }
       if (!restored) {
         result.restore_failed = true;
@@ -774,7 +752,7 @@ const capturePageDebugHtml = () =>
     const ping = async (payload) => {
       if (typeof emit !== "function") return;
       try {
-        await emit(EventType.MODEL_SELECTED || "model_selected", payload || {});
+        await emit(EventType.MODEL_SELECTED, payload || {});
       } catch (_) {
         /* keepalive best-effort */
       }
@@ -802,7 +780,7 @@ const capturePageDebugHtml = () =>
       models = modelsFromItems(scraped.items);
       if (models.length) break;
       if (debugMode) break;
-      await H().sleep(H().gaussianDelay(350, 80, 200, 600));
+      await H.sleep(H.gaussianDelay(350, 80, 200, 600));
     }
     await closePickerIfOpen();
 
@@ -829,7 +807,7 @@ const capturePageDebugHtml = () =>
     for (const m of probe_targets) {
       throwIfAborted();
       await ping({ phase: "probe", model: m.label });
-      await H().sleep(H().gaussianDelay(180, 50, 90, 320));
+      await H.sleep(H.gaussianDelay(180, 50, 90, 320));
       const probe = await probeModelHighEffort(m);
       await ping({ phase: "probe_done", model: m.label, high: !!probe.high });
       if (probe.restore_failed) {
@@ -882,7 +860,6 @@ const capturePageDebugHtml = () =>
     };
   };
 
-  const modelMatches = (label, wantRaw) => chipMatches(label, wantRaw);
 
   const selectModelAndEffort = async (model, effort, opts = {}) => {
     const debug = !!opts.debug;
@@ -917,9 +894,9 @@ const capturePageDebugHtml = () =>
           "model_not_found"
         );
       }
-      await H().humanClick(clickableMenuEl(modelItem.el));
-      await H().betweenActions();
-      await H().sleep(H().gaussianDelay(250, 60, 120, 450));
+      await H.humanClick(clickableMenuEl(modelItem.el));
+      await H.betweenActions();
+      await H.sleep(H.gaussianDelay(250, 60, 120, 450));
       if (findUnlockPopup()) {
         await dismissUnlockPopup();
         debugThrow(
@@ -956,9 +933,9 @@ const capturePageDebugHtml = () =>
 
       const effortItem = effortMenu.find((i) => matchWantEffort(i, wantEffort));
       if (effortItem) {
-        await H().humanClick(clickableMenuEl(effortItem.el));
-        await H().betweenActions();
-        await H().sleep(H().gaussianDelay(220, 50, 120, 400));
+        await H.humanClick(clickableMenuEl(effortItem.el));
+        await H.betweenActions();
+        await H.sleep(H.gaussianDelay(220, 50, 120, 400));
         if (findUnlockPopup()) {
           await dismissUnlockPopup();
           debugThrow(
@@ -979,14 +956,14 @@ const capturePageDebugHtml = () =>
       }
 
       await closePickerIfOpen();
-      await H().sleep(H().gaussianDelay(180, 40, 90, 320));
+      await H.sleep(H.gaussianDelay(180, 40, 90, 320));
       let label = readActiveModelLabel();
       let stuckEffort = effortFromLabel(label);
       // Reopen/read if chip does not yet show the effort word.
       if (stuckEffort !== wantEffort) {
         try {
           await openPicker();
-          await H().sleep(H().gaussianDelay(160, 40, 80, 280));
+          await H.sleep(H.gaussianDelay(160, 40, 80, 280));
           const rows = await waitEffortRowsStable(effortOpts);
           const selected = rows.find(
             (i) =>
@@ -1000,7 +977,7 @@ const capturePageDebugHtml = () =>
           if (stuckEffort !== wantEffort && !selected) {
             // One more chip read after close.
             await closePickerIfOpen();
-            await H().sleep(H().gaussianDelay(160, 40, 80, 280));
+            await H.sleep(H.gaussianDelay(160, 40, 80, 280));
             label = readActiveModelLabel() || label;
             stuckEffort = effortFromLabel(label);
           }
@@ -1050,7 +1027,6 @@ export {
   capturePageDebugHtml,
   listUnlockedModels,
   selectModelAndEffort,
-  modelMatches,
   chipMatches,
   pickModelRow,
   modelCoreTokens,
@@ -1068,28 +1044,3 @@ export {
   tokenTailEq,
   effortFromLabel,
 };
-
-/** KBGeminiModels-shaped API for callers that prefer one object. */
-export const createGeminiModels = () => ({
-  isLocked,
-  isEffectivelyLocked,
-  findUnlockPopup,
-  findModelTrigger,
-  readActiveModelLabel,
-  listUnlockedModels,
-  selectModelAndEffort,
-  modelMatches,
-  chipMatches,
-  pickModelRow,
-  modelCoreTokens,
-  isModelRowLabel,
-  isEffortOnlyLabel,
-  isStrictEffortRow,
-  matchWantEffort,
-  effortPrimaryText,
-  modelsFromItems,
-  discoverEffortLevelsSeen,
-  clickableMenuEl,
-  isInteractiveControl,
-  captureRowHtml,
-});

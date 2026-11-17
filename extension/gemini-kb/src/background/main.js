@@ -15,7 +15,7 @@ import {
 const CONTENT_FILES = ["build-meta.js", "content.js"];
 
 const DEFAULTS = {
-  kbUrl: "http://127.0.0.1:8080",
+  kbUrl: "http://127.0.0.1:9099",
   autoSave: true,
   lastSweepAt: null,
   chats: {},
@@ -374,7 +374,10 @@ const scheduleCaptchaBackoff = async (reason = "captcha") => {
 const reconcileDocs = async () => {
   try {
     const res = await kbFetch("/docs?prefix=gemini/");
-    if (!res.ok) return;
+    if (!res.ok) {
+      logWarn("reconcileDocs HTTP", res.status);
+      return;
+    }
     const body = await res.json();
     const state = await getState();
     const chats = { ...state.chats };
@@ -398,8 +401,8 @@ const reconcileDocs = async () => {
       };
     }
     await setState({ chats });
-  } catch {
-    /* soft fail */
+  } catch (err) {
+    logWarn("reconcileDocs failed", String(err?.message ?? err));
   }
 };
 
@@ -1166,6 +1169,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       case MsgType.TRUSTED_INPUT: {
         const tabId = sender.tab?.id;
         sendResponse(await handleTrustedInput(tabId, msg));
+        return;
+      }
+      case MsgType.FOCUS_TAB: {
+        // Gemini often will not start generation until the tab/window is focused.
+        const tab = sender.tab;
+        if (!tab?.id) {
+          sendResponse({ ok: false, error: "no tab" });
+          return;
+        }
+        await activateTab(tab);
+        sendResponse({ ok: true });
         return;
       }
 

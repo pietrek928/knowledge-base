@@ -6,8 +6,8 @@
   "permissions": ["storage", "alarms", "tabs", "scripting", "debugger"],
   "host_permissions": [
     "https://gemini.google.com/*",
-    "http://127.0.0.1:8080/*",
-    "http://localhost:8080/*"
+    "http://127.0.0.1:9099/*",
+    "http://localhost:9099/*"
   ],
   "background": {
     "service_worker": "background.js"

@@ -1,15 +1,20 @@
 [Unit]
 Description=Knowledge Base (Granian)
-After=network.target
+Documentation=file:%h/Documents/knowledge-base/README.md
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
-User=%i
-WorkingDirectory=/home/%i/Documents/knowledge-base
-Environment=KB_CONFIG=/home/%i/Documents/knowledge-base/config.json
-ExecStart=/home/%i/.local/bin/uv run --directory /home/%i/Documents/knowledge-base kb serve --host 127.0.0.1 --port 8080
+WorkingDirectory=%h/Documents/knowledge-base
+Environment=KB_CONFIG=%h/Documents/knowledge-base/config.json
+ExecStart=%h/.local/bin/uv run --directory %h/Documents/knowledge-base kb serve --host 127.0.0.1 --port 9099
 Restart=on-failure
 RestartSec=3
+
+# Soft stop so extension browsers[].busy clears (SIGINT/SIGTERM); avoid KillMode=control-group race.
+TimeoutStopSec=20
+KillSignal=SIGTERM
 
 [Install]
 WantedBy=default.target

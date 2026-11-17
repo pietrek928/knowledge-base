@@ -15,18 +15,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   const rand = (min, max) => min + Math.random() * (max - min);
 
-  const gaussianDelay = (mean, sigma, min, max) => {
-    if (typeof gaussMs === "function") {
-      return gaussMs(mean, sigma, min, max);
-    }
-    // Fallback Box-Muller: clamp away from 0 so Math.log(u) never -Inf / NaN.
-    const eps = Number.EPSILON;
-    const u = Math.max(eps, Math.random());
-    const v = Math.max(eps, Math.random());
-    const z = Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
-    const val = mean + z * sigma;
-    return Math.max(min, Math.min(max, val));
-  };
+  const gaussianDelay = (mean, sigma, min, max) => gaussMs(mean, sigma, min, max);
 
   const betweenActions = async () => {
     await sleep(gaussianDelay(450, 120, 200, 800));
@@ -61,6 +50,23 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
       if (err?.aborted || err?.cancelled) throw err;
       return { ok: false, error: String(err?.message ?? err) };
     }
+  };
+
+  /** Bring the Gemini tab/window to the front (generation often stalls in background). */
+  const focusTab = async () => {
+    try {
+      const res = await chrome.runtime.sendMessage({ type: MsgType.FOCUS_TAB });
+      if (res?.ok === false) return res;
+    } catch (err) {
+      return { ok: false, error: String(err?.message ?? err) };
+    }
+    // Wait until the document is visible (activateTab is async across processes).
+    const t0 = Date.now();
+    while (document.visibilityState !== "visible" && Date.now() - t0 < 2500) {
+      await sleep(gaussianDelay(120, 35, 60, 220));
+    }
+    await sleep(gaussianDelay(180, 50, 80, 320));
+    return { ok: true, visible: document.visibilityState === "visible" };
   };
 
   const bezierPoints = (x0, y0, x1, y1, steps) => {
@@ -627,6 +633,7 @@ export {
   humanClick,
   humanType,
   humanKey,
+  focusTab,
   wanderPointer,
   composerText,
   composerHasPrompt,

@@ -29,7 +29,7 @@ uv run kb-cli query "Reply with exactly one word: pong. nonce:$RANDOM" \
   --model 'Quick answers 3.5 Flash-Lite' --timeout 180 --final-json
 ```
 
-If `kb-cli browsers` cannot connect, start **one** `kb serve` on `:8080`. If the port is already open, do not start another — duplicate listeners flap `browsers[]`.
+If `kb-cli browsers` cannot connect, start **one** `kb serve` on `:9099`. If the port is already open, do not start another — duplicate listeners flap `browsers[]`.
 
 ## Waits / pacing (no fixed sleeps)
 
