@@ -25,19 +25,27 @@ const PAGE_SIZE = 10;
 const MAX_RPC_PAGES = 8;
 const gSleep = (mean, sigma, min, max) => H.sleep(gaussMs(mean, sigma, min, max));
 
-let debounceTimer = null;
-let lastAttemptAt = 0;
-let extracting = false;
-let batchexecuteReqId = 100000 + Math.floor(Math.random() * 9000);
-let lastScheduledCid = null;
-/** Best-effort abort for in-flight remoteQuery / listUnlockedModels. */
-let remoteAborted = false;
+/** Page-lifetime CS mutables — survive same-hash reinject; abort hook always reads this bag. */
+const CS = (globalThis.__KB_CS_STATE ||= {
+  generation: 0,
+  remoteAborted: false,
+  remoteActive: false,
+  extracting: false,
+  batchexecuteReqId: 100000 + Math.floor(Math.random() * 9000),
+  debounceTimer: null,
+  lastAttemptAt: 0,
+  lastScheduledCid: null,
+});
 
+const isRemoteAborted = () => !!CS.remoteAborted;
+const setRemoteAborted = (v) => {
+  CS.remoteAborted = !!v;
+};
 const throwIfRemoteAborted = () => {
-  if (!remoteAborted) return;
+  if (!isRemoteAborted()) return;
   throw Object.assign(new Error("command cancelled"), { cancelled: true });
 };
-// gemini_models.js (hot-reinjected) checks this during long probe loops.
+// Always rebind — models/index.js and reinjected worlds must call the CS-backed hook.
 globalThis.__kbThrowIfRemoteAborted = throwIfRemoteAborted;
 
 const conversationIdFromUrl = (href = location.href) => {
@@ -507,8 +515,8 @@ const fetchPage = async (conversationId, cursor, runtime) => {
   const inner = JSON.stringify(args);
   // "generic" is what the real web client also uses in f.req; keep it but send real sid/bl/_reqid.
   const freq = JSON.stringify([[["hNvQHb", inner, null, "generic"]]]);
-  const reqId = batchexecuteReqId;
-  batchexecuteReqId += 100000;
+  const reqId = CS.batchexecuteReqId;
+  CS.batchexecuteReqId += 100000;
   const params = new URLSearchParams({
     rpcids: "hNvQHb",
     "source-path": `/app/${conversationId.replace(/^c_/, "")}`,
@@ -573,11 +581,11 @@ const pageTitle = () => {
 const runExtractAndSend = async ({ force = false } = {}) => {
   const id = conversationIdFromUrl();
   if (!id) return;
-  if (extracting) return;
+  if (CS.extracting || CS.remoteActive) return;
   const now = Date.now();
-  if (!force && now - lastAttemptAt < gaussMs(60_000, 12_000, 40_000, 95_000)) return;
-  lastAttemptAt = now;
-  extracting = true;
+  if (!force && now - CS.lastAttemptAt < gaussMs(60_000, 12_000, 40_000, 95_000)) return;
+  CS.lastAttemptAt = now;
+  CS.extracting = true;
   try {
     const { turns, complete } = await extractFullThread(id);
     chrome.runtime.sendMessage({
@@ -601,15 +609,15 @@ const runExtractAndSend = async ({ force = false } = {}) => {
       error: String(err?.message ?? err),
     });
   } finally {
-    extracting = false;
+    CS.extracting = false;
   }
 };
 
 const scheduleExtract = () => {
   const id = conversationIdFromUrl();
   if (!id) return;
-  clearTimeout(debounceTimer);
-  debounceTimer = setTimeout(
+  clearTimeout(CS.debounceTimer);
+  CS.debounceTimer = setTimeout(
     () => runExtractAndSend({ force: false }),
     gaussMs(4200, 900, 2200, 7500)
   );
@@ -844,133 +852,210 @@ const scrapeDomTurns = () => {
   return turns;
 };
 
-const waitForGenerationEnd = async (timeoutMs, onProgress) => {
+const MIN_SUBSTANTIVE_RESPONSE = 200;
+
+const createGenerationWaitState = (timeoutMs) => {
   const start = Date.now();
-  // Idle + hard caps share the broker timeout (DELTA does not extend broker).
-  const idleLimitMs = timeoutMs;
-  const hardLimitMs = timeoutMs;
-  // Flat response_len while Stop/busy stays lit (false generating) → bail well before wall.
-  const quietLimitMs = Math.min(25_000, Math.max(12_000, Math.floor(timeoutMs * 0.2)));
-  let sawGen = false;
-  let peakLen = 0;
-  let stable = 0;
-  let lastLen = -1;
-  let lastScrollAt = 0;
-  let scrollCooldownMs = 0;
-  let lenAtLastScroll = -1;
-  let scrollFires = 0;
-  let lastScrollTop = 0;
-  let lastProgressAt = Date.now();
-  let lastLenChangeAt = Date.now();
-  const minWaitMs = 2500;
-  const markProgress = () => {
-    lastProgressAt = Date.now();
+  return {
+    start,
+    idleLimitMs: timeoutMs,
+    hardLimitMs: timeoutMs,
+    quietLimitMs: Math.min(25_000, Math.max(12_000, Math.floor(timeoutMs * 0.2))),
+    sawGen: false,
+    peakLen: 0,
+    stable: 0,
+    lastLen: -1,
+    lastScrollAt: 0,
+    scrollCooldownMs: 0,
+    lenAtLastScroll: -1,
+    scrollFires: 0,
+    lastScrollTop: 0,
+    lastProgressAt: start,
+    lastLenChangeAt: start,
+    minWaitMs: 2500,
+    markProgress() {
+      this.lastProgressAt = Date.now();
+    },
+    finish(extra = {}) {
+      return {
+        sawGen: this.sawGen,
+        peakLen: this.peakLen,
+        elapsed_ms: Date.now() - this.start,
+        ...extra,
+      };
+    },
   };
-  const finish = (extra = {}) => ({
-    sawGen,
-    peakLen,
-    elapsed_ms: Date.now() - start,
-    ...extra,
-  });
+};
+
+/**
+ * Quiet bail: substantive text, or no longer generating.
+ * Tiny plateau (~53) while Stop is lit keeps waiting; sticky aria-busy alone
+ * must not block a short finished reply forever (gate on `gen`, not broad busy).
+ */
+const shouldQuietBail = (state, bodyLen, { gen, active }, now, elapsed) => {
+  if (!state.sawGen || elapsed < state.minWaitMs) return false;
+  if (now - state.lastLenChangeAt < state.quietLimitMs) return false;
+  if (!active) return true;
+  if (bodyLen >= MIN_SUBSTANTIVE_RESPONSE) return true;
+  // Short reply + sticky busy class but Stop gone → allow quiet exit.
+  if (!gen && bodyLen > 0) return true;
+  // Near hard wall, accept a short plateau rather than cancel mid-wait.
+  if (state.hardLimitMs - elapsed < 8000 && bodyLen > 0 && !gen) return true;
+  return false;
+};
+
+const maybeScrollDuringGeneration = async (state, bodyLen, active) => {
+  const now = Date.now();
+  if (state.lenAtLastScroll >= 0 && bodyLen < state.lenAtLastScroll - 40) {
+    state.lenAtLastScroll = bodyLen;
+  }
+  const tailEl = latestResponseTailEl();
+  const tailGap = tailEl
+    ? tailEl.getBoundingClientRect().bottom - composerSafeBottom()
+    : 0;
+  const tailBelow = !!tailEl && tailGap > 40;
+  const grewSinceScroll =
+    state.lenAtLastScroll < 0
+      ? state.lastLen >= 0 && bodyLen - state.lastLen > 60
+      : bodyLen - state.lenAtLastScroll >= 100;
+  const pollSpike = state.lastLen >= 0 && bodyLen - state.lastLen > 60;
+  if (tailBelow && (grewSinceScroll || pollSpike) && now - state.lastScrollAt >= state.scrollCooldownMs) {
+    state.scrollCooldownMs = active
+      ? gaussMs(900, 200, 500, 1400)
+      : gaussMs(3000, 700, 2000, 4000);
+    const scrollRes = await readLastReplyHuman({ reason: "mid_stream" });
+    state.lastScrollAt = Date.now();
+    state.lenAtLastScroll = bodyLen;
+    if (scrollRes?.applied) {
+      state.scrollFires += 1;
+      state.lastScrollTop = Math.round(
+        H.resolveScrollRoot(tailEl || document.body)?.scrollTop || 0
+      );
+    }
+  }
+  return { tailEl, tailGap };
+};
+
+const generationSettled = (state, bodyLen, active, elapsed) => {
+  if (state.sawGen && !active) {
+    if (state.lastLen >= 0 && Math.abs(bodyLen - state.lastLen) < 40) state.stable += 1;
+    else state.stable = 0;
+    if (state.stable >= 4 && elapsed >= state.minWaitMs) return "done";
+  }
+  if (!state.sawGen && !active && elapsed >= state.minWaitMs) {
+    if (state.lastLen >= 0 && bodyLen > state.lastLen + 40) {
+      state.sawGen = true;
+      state.markProgress();
+      state.stable = 0;
+    } else if (state.lastLen >= 0 && bodyLen > 80 && Math.abs(bodyLen - state.lastLen) < 40) {
+      state.stable += 1;
+      if (state.stable >= 8) return "empty";
+    } else {
+      state.stable = 0;
+    }
+  }
+  return null;
+};
+
+const emitGenerationDelta = (onProgress, state, { gen, busy, bodyLen, elapsed, now, tailEl, tailGap }) => {
+  if (typeof onProgress !== "function") return;
+  try {
+    const root = H.resolveScrollRoot(tailEl || document.body);
+    onProgress({
+      generating: !!(gen || busy),
+      elapsed_ms: elapsed,
+      response_len: bodyLen,
+      idle_ms: now - state.lastProgressAt,
+      hard_left_ms: state.hardLimitMs - elapsed,
+      tail_gap: Math.round(Math.max(-9999, Math.min(9999, tailGap))),
+      scroll_fires: state.scrollFires,
+      scroll_top: Math.round(root?.scrollTop || state.lastScrollTop || 0),
+    });
+  } catch {
+    /* ignore */
+  }
+};
+
+const waitForGenerationEnd = async (timeoutMs, onProgress) => {
+  const state = createGenerationWaitState(timeoutMs);
 
   while (true) {
     throwIfRemoteAborted();
     const now = Date.now();
-    const elapsed = now - start;
-    if (elapsed >= hardLimitMs) break;
-    if (now - lastProgressAt >= idleLimitMs) break;
+    const elapsed = now - state.start;
+    if (elapsed >= state.hardLimitMs) break;
+    if (now - state.lastProgressAt >= state.idleLimitMs) break;
 
     if (location.pathname.includes("/sorry")) {
       throw Object.assign(new Error("captcha /sorry page"), { captcha: true });
     }
 
     const { gen, len: bodyLen, busy, active } = generationProgressSignals();
-    if (bodyLen > peakLen) peakLen = bodyLen;
+    if (bodyLen > state.peakLen) state.peakLen = bodyLen;
     if (active) {
-      sawGen = true;
-      stable = 0;
+      state.sawGen = true;
+      state.stable = 0;
     }
-    // Length change is the only progress signal (not a stuck Stop/busy bit).
-    if (lastLen >= 0 && Math.abs(bodyLen - lastLen) > 15) {
-      markProgress();
-      lastLenChangeAt = now;
-      stable = 0;
-    } else if (lastLen < 0 && bodyLen > 0) {
-      markProgress();
-      lastLenChangeAt = now;
+    if (state.lastLen >= 0 && Math.abs(bodyLen - state.lastLen) > 15) {
+      state.markProgress();
+      state.lastLenChangeAt = now;
+      state.stable = 0;
+    } else if (state.lastLen < 0 && bodyLen > 0) {
+      state.markProgress();
+      state.lastLenChangeAt = now;
     }
-    // Saw generation, then no length movement for quietLimit — even if still "active".
-    if (
-      sawGen &&
-      elapsed >= minWaitMs &&
-      now - lastLenChangeAt >= quietLimitMs
-    ) {
+
+    if (shouldQuietBail(state, bodyLen, { gen, active }, now, elapsed)) {
       await gSleep(850, 180, 450, 1400);
-      return finish({ timedOut: true, quiet: true });
-    }
-
-    if (lenAtLastScroll >= 0 && bodyLen < lenAtLastScroll - 40) {
-      // Thinking collapse / DOM rewrite — don't wait for +100 from a stale peak.
-      lenAtLastScroll = bodyLen;
-    }
-    const tailEl = latestResponseTailEl();
-    const tailGap = tailEl
-      ? tailEl.getBoundingClientRect().bottom - composerSafeBottom()
-      : 0;
-    const tailBelow = !!tailEl && tailGap > 40;
-    const grewSinceScroll =
-      lenAtLastScroll < 0
-        ? lastLen >= 0 && bodyLen - lastLen > 60
-        : bodyLen - lenAtLastScroll >= 100;
-    const pollSpike = lastLen >= 0 && bodyLen - lastLen > 60;
-    // Growth (or spike) required — `active` only picks cooldown, does not force scroll.
-    if (tailBelow && (grewSinceScroll || pollSpike)) {
-      if (now - lastScrollAt >= scrollCooldownMs) {
-        scrollCooldownMs = active
-          ? gaussMs(900, 200, 500, 1400)
-          : gaussMs(3000, 700, 2000, 4000);
-        const scrollRes = await readLastReplyHuman({ reason: "mid_stream" });
-        lastScrollAt = Date.now();
-        lenAtLastScroll = bodyLen;
-        if (scrollRes?.applied) {
-          scrollFires += 1;
-          lastScrollTop = Math.round(
-            (H.resolveScrollRoot(tailEl || document.body)?.scrollTop || 0)
-          );
+      // Brief re-wait if still active and length grows after quiet exit.
+      if (active) {
+        const peakAtQuiet = state.peakLen;
+        const reWaitUntil = Math.min(
+          state.start + state.hardLimitMs,
+          Date.now() + gaussMs(4500, 800, 2500, 7000)
+        );
+        let grew = false;
+        while (Date.now() < reWaitUntil) {
+          throwIfRemoteAborted();
+          const again = generationProgressSignals();
+          if (again.len > peakAtQuiet + 40) {
+            state.peakLen = Math.max(state.peakLen, again.len);
+            state.lastLen = again.len;
+            state.markProgress();
+            state.lastLenChangeAt = Date.now();
+            grew = true;
+            if (!again.active) {
+              return state.finish({ quiet: true });
+            }
+            break;
+          }
+          if (!again.active) break;
+          await H.sleep(H.gaussianDelay(450, 100, 250, 800));
+        }
+        const after = generationProgressSignals();
+        if (grew && after.active && Date.now() - state.start < state.hardLimitMs) {
+          state.lastLen = after.len;
+          continue;
+        }
+        if (grew && !after.active) {
+          return state.finish({ quiet: true });
         }
       }
+      return state.finish({ timedOut: true, quiet: true });
     }
 
-    // Stop/streaming gone after we saw generation, and response text settled.
-    if (sawGen && !active) {
-      if (lastLen >= 0 && Math.abs(bodyLen - lastLen) < 40) stable += 1;
-      else stable = 0;
-      if (stable >= 4 && elapsed >= minWaitMs) {
-        await gSleep(1600, 350, 900, 2800); // let batchexecute index the new turn
-        return finish();
-      }
+    const { tailEl, tailGap } = await maybeScrollDuringGeneration(state, bodyLen, active);
+    const settled = generationSettled(state, bodyLen, active, elapsed);
+    if (settled === "done") {
+      await gSleep(1600, 350, 900, 2800);
+      return state.finish();
     }
-    // Fast models sometimes never show Stop; require growth then plateau.
-    if (!sawGen && !active && elapsed >= minWaitMs) {
-      if (lastLen >= 0 && bodyLen > lastLen + 40) {
-        // Saw some growth without Stop — treat as generation.
-        sawGen = true;
-        markProgress();
-        stable = 0;
-      } else if (lastLen >= 0 && bodyLen > 80 && Math.abs(bodyLen - lastLen) < 40) {
-        stable += 1;
-        if (stable >= 8) {
-          // No Stop and no growth for a while — likely a failed/empty submit.
-          await gSleep(850, 180, 450, 1400);
-          return finish({ sawGen: false });
-        }
-      } else {
-        stable = 0;
-      }
+    if (settled === "empty") {
+      await gSleep(850, 180, 450, 1400);
+      return state.finish({ sawGen: false });
     }
 
-    lastLen = bodyLen;
-    // Occasional pointer wander so the generation wait is not a frozen document.
+    state.lastLen = bodyLen;
     if (elapsed > gaussMs(2100, 400, 1200, 3500) && Math.random() < 0.12) {
       try {
         await H.wanderPointer();
@@ -978,28 +1063,11 @@ const waitForGenerationEnd = async (timeoutMs, onProgress) => {
         /* ignore */
       }
     }
-    if (typeof onProgress === "function") {
-      try {
-        const root = H.resolveScrollRoot(tailEl || document.body);
-        onProgress({
-          generating: !!(gen || busy),
-          elapsed_ms: elapsed,
-          response_len: bodyLen,
-          idle_ms: now - lastProgressAt,
-          hard_left_ms: hardLimitMs - elapsed,
-          tail_gap: Math.round(Math.max(-9999, Math.min(9999, tailGap))),
-          scroll_fires: scrollFires,
-          scroll_top: Math.round(root?.scrollTop || lastScrollTop || 0),
-        });
-      } catch {
-        /* ignore */
-      }
-    }
+    emitGenerationDelta(onProgress, state, { gen, busy, bodyLen, elapsed, now, tailEl, tailGap });
     await H.sleep(H.gaussianDelay(450, 100, 250, 800));
   }
-  // Soft timeout: still attempt extract rather than hard-fail after long wait.
   await gSleep(850, 180, 450, 1400);
-  return finish({ timedOut: true });
+  return state.finish({ timedOut: true });
 };
 
 const normalizePromptNeedle = (s) =>
@@ -1067,19 +1135,41 @@ const expandShowMoreIn = (el) => {
 
 const turnsLookComplete = (
   turns,
-  { minTurns, promptText, needleScope = "last-user", nearDeadline, attempt }
+  { minTurns, promptText, needleScope = "last-user", requireModel = false }
 ) => {
   const hasUser = turns.some((t) => t.role === "user" && (t.text || "").trim());
   const hasModel = turns.some(
     (t) => (t.role === "gemini" || t.role === "model") && (t.text || "").trim()
   );
   const promptOk = !promptText || userTurnMatchesPrompt(turns, promptText, { needleScope });
-  return (
-    turns.length >= minTurns &&
-    hasUser &&
-    promptOk &&
-    (hasModel || (nearDeadline && attempt >= 3))
+  return turns.length >= minTurns && hasUser && promptOk && (!requireModel || hasModel);
+};
+
+const lastTurnText = (turns, rolePred) => {
+  const hits = (turns || []).filter((t) => rolePred(t) && String(t.text || "").trim());
+  return hits.length ? String(hits[hits.length - 1].text || "") : "";
+};
+
+/** Prefer DOM when last user matches and DOM assistant is longer / RPC missing model. */
+const preferDomByText = (dom, rpcTurns, promptText, needleScope = "last-user") => {
+  if (!dom?.length) return false;
+  if (
+    promptText &&
+    !userTurnMatchesPrompt(dom, promptText, { needleScope })
+  ) {
+    return false;
+  }
+  const domAssist = lastTurnText(
+    dom,
+    (t) => t.role === "gemini" || t.role === "model"
   );
+  const rpcAssist = lastTurnText(
+    rpcTurns || [],
+    (t) => t.role === "gemini" || t.role === "model"
+  );
+  if (domAssist && !rpcAssist) return true;
+  if (domAssist.length > rpcAssist.length + 40) return true;
+  return false;
 };
 
 const extractTurnsWithRetry = async (
@@ -1090,29 +1180,26 @@ const extractTurnsWithRetry = async (
     promptText = null,
     preferDom = false,
     needleScope = "last-user",
+    requireModel = false,
   } = {}
 ) => {
   const start = Date.now();
   let last = { turns: [], complete: false };
   let attempt = 0;
-  const lookOpts = { minTurns, promptText, needleScope };
+  const lookOpts = { minTurns, promptText, needleScope, requireModel };
   while (Date.now() - start < timeoutMs) {
     attempt += 1;
-    const nearDeadline = Date.now() - start > timeoutMs * 0.75;
-    // Prefer DOM after a live generate — avoids hammering private hNvQHb.
     if (preferDom || attempt === 1) {
       const dom = scrapeDomTurns();
-      if (turnsLookComplete(dom, { ...lookOpts, nearDeadline, attempt })) {
-        // DOM turn looks whole for this query → allow ingest (was always false → pendingFullSync).
+      if (turnsLookComplete(dom, lookOpts)) {
         return { turns: dom, complete: true, source: ExtractSource.DOM };
       }
     }
-    // RPC at most every other attempt, and not on the first preferDom pass.
     if (!preferDom || attempt >= 2) {
       try {
         last = await extractFullThread(conversationId);
         last.source = ExtractSource.RPC;
-        if (turnsLookComplete(last.turns || [], { ...lookOpts, nearDeadline, attempt })) {
+        if (turnsLookComplete(last.turns || [], lookOpts)) {
           return last;
         }
       } catch (err) {
@@ -1122,12 +1209,8 @@ const extractTurnsWithRetry = async (
     await H.sleep(H.gaussianDelay(2200, 400, 1400, 3500));
   }
   const dom = scrapeDomTurns();
-  if (dom.length > (last.turns || []).length) {
-    const ok = turnsLookComplete(dom, {
-      ...lookOpts,
-      nearDeadline: true,
-      attempt,
-    });
+  if (preferDomByText(dom, last.turns || [], promptText, needleScope)) {
+    const ok = turnsLookComplete(dom, lookOpts);
     return { turns: dom, complete: !!ok, source: ExtractSource.DOM };
   }
   return last;
@@ -1346,46 +1429,101 @@ const remotePageHtml = (params = {}) => {
   };
 };
 
-const remoteQuery = async (params, emit) => {
-  const text = params.text || "";
-  if (!text) throw new Error("query text required");
-  throwIfRemoteAborted();
+const findNewChatControl = () => {
+  const sels = [
+    'a[aria-label*="New chat" i]',
+    'button[aria-label*="New chat" i]',
+    '[data-test-id*="new-chat" i]',
+    'a[href="/app"]',
+    'a[href="https://gemini.google.com/app"]',
+  ];
+  for (const s of sels) {
+    for (const el of document.querySelectorAll(s)) {
+      const t = `${el.getAttribute("aria-label") || ""} ${el.textContent || ""}`.trim();
+      // Require an accessible "New chat" name — bare /app href is often the logo.
+      if (!/new chat/i.test(t)) continue;
+      const r = el.getBoundingClientRect?.();
+      if (r && r.width > 2 && r.height > 2) return el;
+    }
+  }
+  return null;
+};
 
-  if (params.conversation_id) {
-    assertOnConversation(params.conversation_id);
+/** Force a blank Gemini thread before compose when no conversation_id was requested. */
+const ensureNewChat = async ({ debug = false } = {}) => {
+  throwIfRemoteAborted();
+  const turnCount = () =>
+    document.querySelectorAll("user-query, model-response").length;
+  // Blank = no cid AND no turns. "/app" with remounted densify still has turns.
+  const isBlank = () => !conversationIdFromUrl() && turnCount() === 0;
+  const confirmBlank = async () => {
+    if (!isBlank()) return false;
+    await gSleep(280, 60, 140, 450);
+    return isBlank();
+  };
+  if (await confirmBlank()) {
+    return { ok: true, skipped: true, conversation_id: conversationIdFromUrl() };
   }
 
+  const ctrl = findNewChatControl();
+  if (!ctrl) {
+    const msg =
+      "fresh query landed on an existing thread and New chat control was not found";
+    if (debug) throw Models.failWithDebug(msg, "new_chat_missing");
+    throw new Error(msg);
+  }
+  await H.focusTab();
+  await H.humanClick(ctrl);
+  const deadline = Date.now() + gaussMs(9000, 1200, 6000, 14000);
+  while (Date.now() < deadline) {
+    throwIfRemoteAborted();
+    if (await confirmBlank()) {
+      return { ok: true, skipped: false, conversation_id: conversationIdFromUrl() };
+    }
+    await gSleep(380, 80, 180, 700);
+  }
+  const cid = conversationIdFromUrl();
+  const turns = turnCount();
+  if (cid || turns > 0) {
+    const msg = `fresh query still on existing thread ${cid || "no-id"} with ${turns} turns`;
+    if (debug) throw Models.failWithDebug(msg, "new_chat_failed");
+    throw new Error(msg);
+  }
+  return { ok: true, skipped: false, conversation_id: cid };
+};
+
+const selectModelForQuery = async (params, emit) => {
   const modelRequested = params.model || null;
   const effortRequested = params.effort || (params.model ? Effort.MEDIUM : null);
   let modelActualLabel = Models.readActiveModelLabel();
-
-  if (modelRequested) {
-    throwIfRemoteAborted();
-    const sel = await Models.selectModelAndEffort(
-      modelRequested,
-      effortRequested || Effort.MEDIUM,
-      { debug: !!params.debug }
-    );
-    await emit(EventType.MODEL_SELECTED, sel);
-    modelActualLabel = sel.label || Models.readActiveModelLabel();
-    // Keepalive immediately — long picker paths otherwise look hung before compose.
-    await emit(EventType.DELTA, { composing: true, response_len: 0 });
+  if (!modelRequested) {
+    return { modelRequested, effortRequested, modelActualLabel };
   }
+  throwIfRemoteAborted();
+  const sel = await Models.selectModelAndEffort(
+    modelRequested,
+    effortRequested || Effort.MEDIUM,
+    { debug: !!params.debug }
+  );
+  await emit(EventType.MODEL_SELECTED, sel);
+  modelActualLabel = sel.label || Models.readActiveModelLabel();
+  await emit(EventType.DELTA, { composing: true, response_len: 0 });
+  return { modelRequested, effortRequested, modelActualLabel };
+};
 
+const composePromptInGemini = async (text, params, emit) => {
   throwIfRemoteAborted();
   const composer = findComposer();
   if (!composer) {
     if (params.debug) throw Models.failWithDebug("composer not found", "composer_not_found");
     throw new Error("composer not found");
   }
-  // Refocus after picker chrome; Escape dismisses any leftover overlay.
   await H.focusTab();
   try {
     await H.humanKey(composer, "Escape");
   } catch {
     /* ignore */
   }
-  // Brief settle / pointer wander before first keystroke after navigation.
   await gSleep(900, 250, 450, 1600);
   throwIfRemoteAborted();
   try {
@@ -1394,7 +1532,6 @@ const remoteQuery = async (params, emit) => {
     /* ignore */
   }
   await H.betweenActions();
-  // Keepalive while CDP compose can run long without generation deltas.
   await emit(EventType.DELTA, { composing: true, response_len: 0 });
   throwIfRemoteAborted();
   try {
@@ -1422,8 +1559,11 @@ const remoteQuery = async (params, emit) => {
     throw new Error(msg);
   }
   await H.betweenActions();
-  throwIfRemoteAborted();
+  return composer;
+};
 
+const submitPromptAndWaitForCid = async (composer, text, params, emit) => {
+  throwIfRemoteAborted();
   const userQueryCount = () => document.querySelectorAll("user-query").length;
   const snapBefore = {
     responseLen: responseTextLen(),
@@ -1447,19 +1587,14 @@ const remoteQuery = async (params, emit) => {
     return submitStarted();
   };
 
-  // Gemini often will not start generation until the tab is focused.
   await H.focusTab();
   try {
     composer.focus();
   } catch {
     /* ignore */
   }
-
-  // Enter first (CDP via always-KEY). Do not wait on Send before Enter.
   await H.humanKey(composer, "Enter", { requireCdp: true });
   let started = await pollSubmitStart(gaussMs(2800, 400, 2000, 3500));
-
-  // One forced CDP Send click if Enter did not start and prompt still sits.
   if (!started && H.composerHasPrompt(composer, text)) {
     await H.focusTab();
     const send = findSendButton();
@@ -1468,14 +1603,12 @@ const remoteQuery = async (params, emit) => {
       started = await pollSubmitStart(gaussMs(2800, 400, 2000, 3500));
     }
   }
-
   if (!started) {
     const msg = "submit not accepted";
     if (params.debug) throw Models.failWithDebug(msg, "submit_failed");
     throw new Error(msg);
   }
 
-  // Conversation id often appears shortly after submit on /app → /app/<id>.
   let id = conversationIdFromUrl();
   for (let i = 0; i < 24 && !id; i++) {
     throwIfRemoteAborted();
@@ -1483,13 +1616,10 @@ const remoteQuery = async (params, emit) => {
     id = conversationIdFromUrl();
   }
   await emit(EventType.SUBMITTED, { conversation_id: id });
+  return id;
+};
 
-  // Idle + hard wait share broker timeout_s (no 3× overrun).
-  const timeoutMs = Math.max(15, Math.min(600, Number(params.timeout_s) || 180)) * 1000;
-  const gen = await waitForGenerationEnd(timeoutMs, (p) => emit(EventType.DELTA, p));
-  throwIfRemoteAborted();
-
-  // Expand/scrape last user bubble BEFORE post_done scroll (virtualization).
+const snapUserPromptDom = async () => {
   const userNodes = document.querySelectorAll("user-query");
   const lastUserEl = userNodes.length ? userNodes[userNodes.length - 1] : null;
   const snapUserText = lastUserEl ? textFromTurnEl(lastUserEl, "user") : "";
@@ -1501,8 +1631,149 @@ const remoteQuery = async (params, emit) => {
     }
     await gSleep(200, 50, 100, 360);
   }
+  return snapUserText;
+};
 
+const snapAssistantDom = async () => {
+  const el = latestModelResponseEl();
+  if (!el) return "";
+  expandShowMoreIn(el);
+  await gSleep(180, 45, 80, 320);
+  return textFromTurnEl(el, "gemini") || "";
+};
+
+/** True when the last model-response sits after a user turn that matches this prompt. */
+const assistantFollowsPromptUser = (promptText) => {
+  const nodes = [...document.querySelectorAll("user-query, model-response")];
+  if (!nodes.length) return false;
+  let lastUserIdx = -1;
+  for (let i = 0; i < nodes.length; i++) {
+    if (nodes[i].tagName.toLowerCase().includes("user")) lastUserIdx = i;
+  }
+  if (lastUserIdx < 0) return false;
+  const userText = textFromTurnEl(nodes[lastUserIdx], "user");
+  if (
+    !userTurnMatchesPrompt([{ role: "user", text: userText }], promptText, {
+      needleScope: "last-user",
+    })
+  ) {
+    return false;
+  }
+  const last = nodes[nodes.length - 1];
+  return lastUserIdx < nodes.length - 1 && last.tagName.toLowerCase().includes("model");
+};
+
+const extractQueryTurns = async (id, text, gen, timeoutMs) => {
+  const extractBudget = Math.min(
+    45_000,
+    Math.max(8_000, timeoutMs - (gen?.elapsed_ms || 0) - 5_000)
+  );
+  return extractTurnsWithRetry(id, {
+    minTurns: 1,
+    timeoutMs: extractBudget,
+    promptText: text,
+    preferDom: true,
+    needleScope: "last-user",
+    requireModel: true,
+  });
+};
+
+const salvageTurnsWithSnap = (
+  turns,
+  complete,
+  source,
+  text,
+  snapUserText,
+  snapAssistantText,
+  { sawGen = false, peakLen = 0, preSubmitLen = 0 } = {}
+) => {
+  let nextTurns = turns || [];
+  let nextComplete = complete;
+  let nextSource = source;
+  let hasPrompt = userTurnMatchesPrompt(nextTurns, text, { needleScope: "last-user" });
+  let hasAssistant = nextTurns.some(
+    (t) =>
+      (t.role === "gemini" || t.role === "model") && String(t.text || "").trim()
+  );
+
+  if (
+    !hasPrompt &&
+    snapUserText &&
+    userTurnMatchesPrompt([{ role: "user", text: snapUserText }], text, {
+      needleScope: "last-user",
+    })
+  ) {
+    const userMatches = nextTurns.some(
+      (t) =>
+        t.role === "user" &&
+        userTurnMatchesPrompt([{ role: "user", text: t.text }], text, {
+          needleScope: "last-user",
+        })
+    );
+    if (!userMatches) {
+      nextTurns = [
+        { role: "user", text: snapUserText, ts_sec: null, ts_nanos: 0 },
+        ...nextTurns,
+      ];
+    }
+    hasPrompt = true;
+  }
+
+  const snap = String(snapAssistantText || "").trim();
+  const snapBelongs =
+    !!sawGen &&
+    snap.length >= 1 &&
+    peakLen > preSubmitLen + 5 &&
+    assistantFollowsPromptUser(text);
+  if (!hasAssistant && snapBelongs) {
+    nextTurns = [
+      ...nextTurns,
+      { role: "gemini", text: snapAssistantText, ts_sec: null, ts_nanos: 0 },
+    ];
+    hasAssistant = true;
+    nextComplete = true;
+    nextSource = ExtractSource.DOM;
+  } else if (hasPrompt && hasAssistant) {
+    nextComplete = true;
+  }
+
+  if (!nextTurns.length || nextComplete === false || !hasPrompt || !hasAssistant) {
+    const users = nextTurns.filter((t) => t.role === "user" && (t.text || "").trim());
+    const userHead = String(users[users.length - 1]?.text || "").slice(0, 80);
+    throw new Error(
+      `stale or empty extract after query (turns=${nextTurns.length}, complete=${nextComplete}, ` +
+        `prompt=${hasPrompt}, assistant=${hasAssistant}, user_head=${JSON.stringify(userHead)})`
+    );
+  }
+  return { turns: nextTurns, complete: nextComplete, source: nextSource };
+};
+
+const remoteQuery = async (params, emit) => {
+  const text = params.text || "";
+  if (!text) throw new Error("query text required");
+  throwIfRemoteAborted();
+
+  if (params.conversation_id) {
+    assertOnConversation(params.conversation_id);
+  } else {
+    await ensureNewChat({ debug: !!params.debug });
+  }
+
+  const { modelRequested, effortRequested, modelActualLabel } = await selectModelForQuery(
+    params,
+    emit
+  );
+  const composer = await composePromptInGemini(text, params, emit);
+  const preSubmitLen = responseTextLen();
+  let id = await submitPromptAndWaitForCid(composer, text, params, emit);
+
+  const timeoutMs = Math.max(15, Math.min(600, Number(params.timeout_s) || 180)) * 1000;
+  const gen = await waitForGenerationEnd(timeoutMs, (p) => emit(EventType.DELTA, p));
+  throwIfRemoteAborted();
+
+  const snapUserText = await snapUserPromptDom();
   await readLastReplyHuman({ reason: "post_done" });
+  const snapAssistantText = await snapAssistantDom();
 
   id = conversationIdFromUrl() || id;
   for (let i = 0; i < 20 && !id; i++) {
@@ -1513,14 +1784,11 @@ const remoteQuery = async (params, emit) => {
   if (!id) throw new Error("conversation id missing after submit");
 
   const afterLabel = Models.readActiveModelLabel();
-  // Honest mismatch: requested label vs live chip (not merely pre/post select).
-  // Empty chip with a request is not a match — treat as unreadable / changed.
   const chipUnreadable = !!(modelRequested && !afterLabel);
   const matchesRequested =
     !modelRequested ||
     (!!afterLabel && Models.chipMatches(afterLabel, modelRequested));
   const modelChanged = !!(modelRequested && !matchesRequested);
-
   if (modelChanged) {
     await emit(EventType.MODEL_CHANGED, {
       from: modelRequested,
@@ -1530,59 +1798,21 @@ const remoteQuery = async (params, emit) => {
   }
 
   throwIfRemoteAborted();
-  const extractBudget = Math.min(
-    45_000,
-    Math.max(8_000, timeoutMs - (gen?.elapsed_ms || 0) - 5_000)
-  );
-  let { turns, complete, source } = await extractTurnsWithRetry(id, {
-    minTurns: 1,
-    timeoutMs: extractBudget,
-    promptText: text,
-    preferDom: true,
-    needleScope: "last-user",
-  });
+  let { turns, complete, source } = await extractQueryTurns(id, text, gen, timeoutMs);
   throwIfRemoteAborted();
-
-  let hasPrompt = userTurnMatchesPrompt(turns, text, { needleScope: "last-user" });
-  let hasAssistant = turns.some(
-    (t) =>
-      (t.role === "gemini" || t.role === "model") && String(t.text || "").trim()
-  );
-  if (
-    !hasPrompt &&
-    snapUserText &&
-    userTurnMatchesPrompt([{ role: "user", text: snapUserText }], text, {
-      needleScope: "last-user",
-    }) &&
-    hasAssistant
-  ) {
-    const userMatches = turns.some(
-      (t) =>
-        t.role === "user" &&
-        userTurnMatchesPrompt([{ role: "user", text: t.text }], text, {
-          needleScope: "last-user",
-        })
-    );
-    if (!userMatches) {
-      turns.unshift({
-        role: "user",
-        text: snapUserText,
-        ts_sec: null,
-        ts_nanos: 0,
-      });
+  ({ turns, complete, source } = salvageTurnsWithSnap(
+    turns,
+    complete,
+    source,
+    text,
+    snapUserText,
+    snapAssistantText,
+    {
+      sawGen: !!gen?.sawGen,
+      peakLen: gen?.peakLen || 0,
+      preSubmitLen,
     }
-    complete = true;
-    hasPrompt = true;
-  }
-  // Stale/empty extracts must not look like success (generation never started, wrong thread).
-  if (!turns.length || complete === false || !hasPrompt || !hasAssistant) {
-    const users = turns.filter((t) => t.role === "user" && (t.text || "").trim());
-    const userHead = String(users[users.length - 1]?.text || "").slice(0, 80);
-    throw new Error(
-      `stale or empty extract after query (turns=${turns.length}, complete=${complete}, ` +
-        `prompt=${hasPrompt}, assistant=${hasAssistant}, user_head=${JSON.stringify(userHead)})`
-    );
-  }
+  ));
 
   try {
     const skimEl = latestModelResponseEl();
@@ -1627,169 +1857,185 @@ const remoteQuery = async (params, emit) => {
 
 const KB_CS_SUPERSEDE = "kb-gemini-cs-supersede";
 
-// Same-world re-inject of the same build must not tear down an in-flight query.
+const runRemoteKind = async (kind, params, emit) => {
+  switch (kind) {
+    case CommandKind.LIST_MODELS:
+      return remoteListModels(params || {}, emit);
+    case CommandKind.PAGE_HTML:
+      return remotePageHtml(params || {});
+    case CommandKind.SEARCH:
+      return params.conversation_id
+        ? await remoteSearchMessages(params)
+        : await remoteSearchConversations(params);
+    case CommandKind.QUERY:
+      return remoteQuery(params || {}, emit);
+    default:
+      throw Object.assign(new Error(`unknown kind ${kind}`), { unknownKind: true });
+  }
+};
+
+const handleRemoteMessage = (msg, _sender, sendResponse) => {
+  if (!msg || !msg.type) return false;
+
+  switch (msg.type) {
+    case MsgType.PUSH_NOW:
+      runExtractAndSend({ force: true }).then(() => sendResponse({ ok: true }));
+      return true;
+
+    case MsgType.PING:
+      sendResponse({
+        ok: true,
+        build: EXT_BUILD,
+        contentHash: CONTENT_HASH,
+        conversation_id: conversationIdFromUrl(),
+        account: detectAccount(),
+        title: pageTitle(),
+      });
+      return true;
+
+    case MsgType.REMOTE_CANCEL: {
+      setRemoteAborted(true);
+      sendResponse({ ok: true, aborted: true });
+      return true;
+    }
+
+    case MsgType.REMOTE: {
+      const { commandId, kind, params } = msg;
+      const genAtStart = CS.generation;
+      setRemoteAborted(false);
+      CS.remoteActive = true;
+      (async () => {
+        const stillMine = () => CS.generation === genAtStart;
+        const emit = async (type, payload) => {
+          if (!stillMine() || isRemoteAborted()) return;
+          chrome.runtime.sendMessage({
+            type: MsgType.REMOTE_EVENT,
+            commandId,
+            eventType: type,
+            payload: payload || {},
+          });
+        };
+        try {
+          const result = await runRemoteKind(kind, params || {}, emit);
+          if (!stillMine()) return;
+          if (isRemoteAborted()) {
+            sendResponse({
+              ok: false,
+              error: "command cancelled",
+              cancelled: true,
+            });
+            return;
+          }
+          sendResponse({ ok: true, result });
+        } catch (err) {
+          if (!stillMine()) return;
+          if (err?.unknownKind) {
+            sendResponse({ ok: false, error: String(err?.message ?? err) });
+            return;
+          }
+          sendResponse({
+            ok: false,
+            error: String(err?.message ?? err),
+            captcha: !!err?.captcha,
+            cancelled: !!err?.cancelled,
+            debug_html: err?.debug_html,
+            debug_reason: err?.debug_reason,
+            debug_html_length: err?.debug_html_length,
+            debug_url: err?.debug_url,
+            debug_title: err?.debug_title,
+            debug_menu: err?.debug_menu,
+          });
+        } finally {
+          if (stillMine()) {
+            CS.remoteActive = false;
+            setRemoteAborted(false);
+          }
+        }
+      })();
+      return true;
+    }
+
+    default:
+      return false;
+  }
+};
+
+// Same-world re-inject of the same build must not tear down an in-flight query —
+// but always rebind the abort hook to the CS-backed function.
 if (globalThis.__KB_CONTENT_HASH_ACTIVE === CONTENT_HASH && globalThis.__KB_CONTENT_LISTENER) {
-  // Already booted this build in this world — skip re-registration.
+  globalThis.__kbThrowIfRemoteAborted = throwIfRemoteAborted;
 } else {
   // New build or new world: ask prior worlds to dispose, then register.
   window.dispatchEvent(new Event(KB_CS_SUPERSEDE));
   globalThis.__KB_CONTENT_HASH_ACTIVE = CONTENT_HASH;
 
-let csDisposed = false;
-const csDisposers = {
-  onMessage: null,
-  popstate: null,
-  visibility: null,
-  pollTimeoutIds: [],
-};
+  let csDisposed = false;
+  const csDisposers = {
+    onMessage: null,
+    popstate: null,
+    visibility: null,
+    pollTimeoutIds: [],
+  };
 
-const disposeContentBoot = () => {
-  if (csDisposed) return;
-  csDisposed = true;
-  if (globalThis.__KB_CONTENT_HASH_ACTIVE === CONTENT_HASH) {
-    globalThis.__KB_CONTENT_HASH_ACTIVE = "";
-  }
-  globalThis.__KB_CONTENT_LISTENER = null;
-  if (csDisposers.onMessage) {
-    chrome.runtime.onMessage.removeListener(csDisposers.onMessage);
-    csDisposers.onMessage = null;
-  }
-  if (csDisposers.popstate) {
-    window.removeEventListener("popstate", csDisposers.popstate);
-    csDisposers.popstate = null;
-  }
-  if (csDisposers.visibility) {
-    document.removeEventListener("visibilitychange", csDisposers.visibility);
-    csDisposers.visibility = null;
-  }
-  for (const tid of csDisposers.pollTimeoutIds) clearTimeout(tid);
-  csDisposers.pollTimeoutIds = [];
-  if (debounceTimer) {
-    clearTimeout(debounceTimer);
-    debounceTimer = null;
-  }
-};
-
-window.addEventListener(KB_CS_SUPERSEDE, disposeContentBoot, { once: true });
-
-csDisposers.onMessage = (msg, _sender, sendResponse) => {
-    if (!msg || !msg.type) return false;
-
-    switch (msg.type) {
-      case MsgType.PUSH_NOW:
-        runExtractAndSend({ force: true }).then(() => sendResponse({ ok: true }));
-        return true;
-
-      case MsgType.PING:
-        sendResponse({
-          ok: true,
-          build: EXT_BUILD,
-          contentHash: CONTENT_HASH,
-          conversation_id: conversationIdFromUrl(),
-          account: detectAccount(),
-          title: pageTitle(),
-        });
-        return true;
-
-      case MsgType.REMOTE_CANCEL: {
-        remoteAborted = true;
-        sendResponse({ ok: true, aborted: true });
-        return true;
-      }
-
-      case MsgType.REMOTE: {
-        const { commandId, kind, params } = msg;
-        remoteAborted = false;
-        (async () => {
-          const emit = async (type, payload) => {
-            if (remoteAborted) return;
-            chrome.runtime.sendMessage({
-              type: MsgType.REMOTE_EVENT,
-              commandId,
-              eventType: type,
-              payload: payload || {},
-            });
-          };
-          try {
-            let result;
-            switch (kind) {
-              case CommandKind.LIST_MODELS:
-                result = await remoteListModels(params || {}, emit);
-                break;
-              case CommandKind.PAGE_HTML:
-                result = remotePageHtml(params || {});
-                break;
-              case CommandKind.SEARCH:
-                result = params.conversation_id
-                  ? await remoteSearchMessages(params)
-                  : await remoteSearchConversations(params);
-                break;
-              case CommandKind.QUERY:
-                result = await remoteQuery(params || {}, emit);
-                break;
-              default:
-                sendResponse({ ok: false, error: `unknown kind ${kind}` });
-                return;
-            }
-            if (remoteAborted) {
-              sendResponse({
-                ok: false,
-                error: "command cancelled",
-                cancelled: true,
-              });
-              return;
-            }
-            sendResponse({ ok: true, result });
-          } catch (err) {
-            sendResponse({
-              ok: false,
-              error: String(err?.message ?? err),
-              captcha: !!err?.captcha,
-              cancelled: !!err?.cancelled,
-              debug_html: err?.debug_html,
-              debug_reason: err?.debug_reason,
-              debug_html_length: err?.debug_html_length,
-              debug_url: err?.debug_url,
-              debug_title: err?.debug_title,
-              debug_menu: err?.debug_menu,
-            });
-          } finally {
-            remoteAborted = false;
-          }
-        })();
-        return true;
-      }
-
-      default:
-        return false;
+  const disposeContentBoot = () => {
+    if (csDisposed) return;
+    csDisposed = true;
+    setRemoteAborted(true);
+    CS.generation += 1;
+    CS.remoteActive = false;
+    if (globalThis.__KB_CONTENT_HASH_ACTIVE === CONTENT_HASH) {
+      globalThis.__KB_CONTENT_HASH_ACTIVE = "";
     }
-};
+    globalThis.__KB_CONTENT_LISTENER = null;
+    if (csDisposers.onMessage) {
+      chrome.runtime.onMessage.removeListener(csDisposers.onMessage);
+      csDisposers.onMessage = null;
+    }
+    if (csDisposers.popstate) {
+      window.removeEventListener("popstate", csDisposers.popstate);
+      csDisposers.popstate = null;
+    }
+    if (csDisposers.visibility) {
+      document.removeEventListener("visibilitychange", csDisposers.visibility);
+      csDisposers.visibility = null;
+    }
+    for (const tid of csDisposers.pollTimeoutIds) clearTimeout(tid);
+    csDisposers.pollTimeoutIds = [];
+    if (CS.debounceTimer) {
+      clearTimeout(CS.debounceTimer);
+      CS.debounceTimer = null;
+    }
+  };
 
-chrome.runtime.onMessage.addListener(csDisposers.onMessage);
-globalThis.__KB_CONTENT_LISTENER = csDisposers.onMessage;
+  window.addEventListener(KB_CS_SUPERSEDE, disposeContentBoot, { once: true });
 
-// Soft URL poll instead of wrapping history.pushState (less fingerprintable).
-const pollUrlChange = () => {
-  if (csDisposed) return;
-  const id = conversationIdFromUrl();
-  if (id && id !== lastScheduledCid) {
-    lastScheduledCid = id;
-    scheduleExtract();
-  }
-  const tid = setTimeout(pollUrlChange, gaussMs(5200, 1100, 2800, 9000));
-  csDisposers.pollTimeoutIds.push(tid);
-};
-csDisposers.pollTimeoutIds.push(
-  setTimeout(pollUrlChange, gaussMs(2800, 700, 1200, 5000))
-);
+  csDisposers.onMessage = handleRemoteMessage;
+  chrome.runtime.onMessage.addListener(csDisposers.onMessage);
+  globalThis.__KB_CONTENT_LISTENER = csDisposers.onMessage;
+  globalThis.__kbThrowIfRemoteAborted = throwIfRemoteAborted;
 
-csDisposers.popstate = scheduleExtract;
-window.addEventListener("popstate", csDisposers.popstate);
+  // Soft URL poll instead of wrapping history.pushState (less fingerprintable).
+  const pollUrlChange = () => {
+    if (csDisposed) return;
+    const id = conversationIdFromUrl();
+    if (id && id !== CS.lastScheduledCid) {
+      CS.lastScheduledCid = id;
+      scheduleExtract();
+    }
+    const tid = setTimeout(pollUrlChange, gaussMs(5200, 1100, 2800, 9000));
+    csDisposers.pollTimeoutIds.push(tid);
+  };
+  csDisposers.pollTimeoutIds.push(
+    setTimeout(pollUrlChange, gaussMs(2800, 700, 1200, 5000))
+  );
 
-csDisposers.visibility = () => {
-  if (document.visibilityState === "visible") scheduleExtract();
-};
-document.addEventListener("visibilitychange", csDisposers.visibility);
+  csDisposers.popstate = scheduleExtract;
+  window.addEventListener("popstate", csDisposers.popstate);
 
-scheduleExtract();
+  csDisposers.visibility = () => {
+    if (document.visibilityState === "visible") scheduleExtract();
+  };
+  document.addEventListener("visibilitychange", csDisposers.visibility);
+
+  scheduleExtract();
 } // end boot for new hash / new world

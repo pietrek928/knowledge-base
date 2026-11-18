@@ -35,15 +35,76 @@ const DEFAULTS = {
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
 const ALARM_NAME = "gemini_kb_weekly";
 const HEARTBEAT_ALARM = "gemini_kb_heartbeat";
-
-let pollRunning = false;
-let commandBusy = false;
-let lastBusyHeartbeatAt = 0;
-let backoffUntil = 0;
-let lastRegisterOk = null;
-/** Set by cancel/timeout so in-flight CDP loops stop; cleared when a command starts. */
-let cdpAbort = false;
 const CDP_CMD_TIMEOUT_MS = 5000;
+
+/** Ephemeral SW mutables — single owner (not chrome.storage). */
+class SwRuntime {
+  contentHash = "";
+  reloadForHashScheduled = false;
+  pendingReloadForHash = false;
+  remoteInFlight = 0;
+  pollRunning = false;
+  commandBusy = false;
+  lastBusyHeartbeatAt = 0;
+  backoffUntil = 0;
+  lastRegisterOk = null;
+  /** Set by cancel/timeout so in-flight CDP loops stop; cleared when a command starts. */
+  cdpAbort = false;
+
+  beginRemote() {
+    this.remoteInFlight += 1;
+  }
+
+  endRemote() {
+    this.remoteInFlight = Math.max(0, this.remoteInFlight - 1);
+    this.maybeReloadForHash();
+  }
+
+  setCdpAbort(v) {
+    this.cdpAbort = !!v;
+  }
+
+  maybeReloadForHash() {
+    if (!this.pendingReloadForHash || this.reloadForHashScheduled || this.remoteInFlight > 0) {
+      return;
+    }
+    this.pendingReloadForHash = false;
+    this.reloadForHashScheduled = true;
+    log("build-meta contentHash changed (deferred); chrome.runtime.reload()");
+    try {
+      chrome.runtime.reload();
+    } catch (err) {
+      this.reloadForHashScheduled = false;
+      logWarn("runtime.reload failed", String(err?.message ?? err));
+    }
+  }
+
+  noteContentHash(next) {
+    const prev = this.contentHash;
+    this.contentHash = next || "";
+    if (prev && next && prev !== next && !this.reloadForHashScheduled) {
+      if (this.remoteInFlight > 0) {
+        this.pendingReloadForHash = true;
+        log("build-meta contentHash changed; defer reload until remote idle", {
+          prev,
+          next,
+          remoteInFlight: this.remoteInFlight,
+        });
+      } else {
+        this.reloadForHashScheduled = true;
+        log("build-meta contentHash changed; chrome.runtime.reload()", { prev, next });
+        try {
+          chrome.runtime.reload();
+        } catch (err) {
+          this.reloadForHashScheduled = false;
+          logWarn("runtime.reload failed", String(err?.message ?? err));
+        }
+      }
+    }
+  }
+}
+
+const SW = (globalThis.__KB_SW_RUNTIME ||= new SwRuntime());
 
 const log = (...args) => {
   console.log("[gemini-kb]", ...args);
@@ -140,7 +201,7 @@ const debuggerDetach = async (tabId) => {
 };
 
 const assertCdpNotAborted = () => {
-  if (!cdpAbort) return;
+  if (!SW.cdpAbort) return;
   throw Object.assign(new Error("cdp aborted"), { aborted: true });
 };
 
@@ -299,7 +360,7 @@ const handleTrustedInput = async (tabId, msg) => {
     await debuggerDetach(tabId);
     return { ok: true };
   }
-  if (cdpAbort) return { ok: false, aborted: true };
+  if (SW.cdpAbort) return { ok: false, aborted: true };
   const state = await getState();
   // TYPE/PASTE/KEY always use CDP: synthetic InputEvent does not stick in
   // Gemini's Angular contenteditable, and submit Enter must be trusted.
@@ -364,7 +425,7 @@ const scheduleCaptchaBackoff = async (reason = "captcha") => {
     captchaStrikes: strikes,
     captchaNeedsUser: true,
   });
-  backoffUntil = until;
+  SW.backoffUntil = until;
   logWarn(
     reason,
     `backoff ~${Math.round((until - Date.now()) / 60_000)}m strike=${strikes}; needs user gesture to clear`
@@ -487,7 +548,7 @@ const ensureAlarm = async () => {
 
 const weeklySweep = async () => {
   // Slow, foreground-only sync — never machine-gun hidden tabs with hNvQHb.
-  if (Date.now() < backoffUntil || Date.now() < (await getState()).captchaBlockedUntil) {
+  if (Date.now() < SW.backoffUntil || Date.now() < (await getState()).captchaBlockedUntil) {
     logWarn("weeklySweep skipped (backoff/captcha)");
     return;
   }
@@ -542,17 +603,17 @@ const registerOrHeartbeat = async () => {
     const res = await kbFetch("/ext/register", { method: "POST", body: JSON.stringify(body) });
     if (res.status === 429) {
       const wait = gaussian(60_000, 12_000, 35_000, 95_000);
-      backoffUntil = Date.now() + wait;
+      SW.backoffUntil = Date.now() + wait;
       logWarn("register rate-limited (429); backing off", Math.round(wait / 1000), "s");
-      lastRegisterOk = false;
+      SW.lastRegisterOk = false;
       return false;
     }
     if (!res.ok) {
       logWarn("register failed", res.status, await res.text().catch(() => ""));
-      lastRegisterOk = false;
+      SW.lastRegisterOk = false;
       return false;
     }
-    if (lastRegisterOk !== true) {
+    if (SW.lastRegisterOk !== true) {
       log(
         "connected to KB",
         kbUrl || DEFAULTS.kbUrl,
@@ -562,13 +623,13 @@ const registerOrHeartbeat = async () => {
         state.account || "-"
       );
     }
-    lastRegisterOk = true;
+    SW.lastRegisterOk = true;
     return true;
   } catch (err) {
-    if (lastRegisterOk !== false) {
+    if (SW.lastRegisterOk !== false) {
       logWarn("KB unreachable", kbUrl || DEFAULTS.kbUrl, String(err?.message ?? err));
     }
-    lastRegisterOk = false;
+    SW.lastRegisterOk = false;
     return false;
   }
 };
@@ -646,29 +707,13 @@ const wantContentHash = () => {
   try {
     // build-meta.js is not imported into the SW; read from generated global if present,
     // else from the extension URL fetch of build-meta.json (sync via last known).
-    return globalThis.__KB_BUILD_META__?.contentHash || _cachedContentHash || "";
+    return globalThis.__KB_BUILD_META__?.contentHash || SW.contentHash || "";
   } catch {
-    return _cachedContentHash || "";
+    return SW.contentHash || "";
   }
 };
 
-let _cachedContentHash = "";
-let _reloadForHashScheduled = false;
-let _pendingReloadForHash = false;
-let remoteInFlight = 0;
-
-const maybeReloadForContentHash = () => {
-  if (!_pendingReloadForHash || _reloadForHashScheduled || remoteInFlight > 0) return;
-  _pendingReloadForHash = false;
-  _reloadForHashScheduled = true;
-  log("build-meta contentHash changed (deferred); chrome.runtime.reload()");
-  try {
-    chrome.runtime.reload();
-  } catch (err) {
-    _reloadForHashScheduled = false;
-    logWarn("runtime.reload failed", String(err?.message ?? err));
-  }
-};
+const maybeReloadForContentHash = () => SW.maybeReloadForHash();
 
 const refreshContentHashCache = async () => {
   try {
@@ -677,33 +722,8 @@ const refreshContentHashCache = async () => {
     if (!res.ok) return;
     const meta = await res.json();
     const next = meta.contentHash || "";
-    const prev = _cachedContentHash;
-    _cachedContentHash = next;
     globalThis.__KB_BUILD_META__ = meta;
-    // Unpacked rebuilds update dist/ on disk while the SW keeps stale content.js.
-    // Reload the extension once so tabs pick up the new contentHash.
-    if (prev && next && prev !== next && !_reloadForHashScheduled) {
-      if (remoteInFlight > 0) {
-        _pendingReloadForHash = true;
-        log("build-meta contentHash changed; defer reload until remote idle", {
-          prev,
-          next,
-          remoteInFlight,
-        });
-      } else {
-        _reloadForHashScheduled = true;
-        log("build-meta contentHash changed; chrome.runtime.reload()", {
-          prev,
-          next,
-        });
-        try {
-          chrome.runtime.reload();
-        } catch (err) {
-          _reloadForHashScheduled = false;
-          logWarn("runtime.reload failed", String(err?.message ?? err));
-        }
-      }
-    }
+    SW.noteContentHash(next);
   } catch {
     /* ignore */
   }
@@ -792,25 +812,25 @@ const pickDebugFields = (src) => {
   return out;
 };
 
-const runRemoteCommand = async (cmd) => {
-  remoteInFlight += 1;
-  const kind = cmd.kind;
-  const params = cmd.params || {};
-  const commandId = cmd.id;
-
-  try {
+const assertRemoteAllowed = async (commandId) => {
   const state0 = await getState();
-  if (state0.captchaNeedsUser || Date.now() < backoffUntil || Date.now() < state0.captchaBlockedUntil) {
+  if (
+    state0.captchaNeedsUser ||
+    Date.now() < SW.backoffUntil ||
+    Date.now() < state0.captchaBlockedUntil
+  ) {
     await postEvent(commandId, EventType.ERROR, {
       error: state0.captchaNeedsUser
         ? "captcha backoff active — open the extension popup after solving /sorry"
         : "captcha/backoff active",
       captcha: true,
     });
-    return;
+    return false;
   }
+  return true;
+};
 
-  // Pace after query writes: reading-time dwell, not a few seconds.
+const paceBeforeRemote = async (kind) => {
   const state = await getState();
   if (kind === CommandKind.QUERY) {
     const until = Math.max(state.nextQueryAfter || 0, state.lastQueryAt || 0);
@@ -819,54 +839,77 @@ const runRemoteCommand = async (cmd) => {
       log("pacing before query", Math.round(wait / 1000), "s");
       await sleepGauss(wait, wait * 0.08, wait * 0.85, wait * 1.15);
     }
-  } else {
-    await sleepGauss(800, 250, 400, 1600);
+    return;
   }
+  await sleepGauss(800, 250, 400, 1600);
+};
+
+/** Open/reuse Gemini tab; forNew creates /app (content ensureNewChat clears remounted threads). */
+const openGeminiTabForCommand = async (params, kind, commandId) => {
+  const forNew = kind === CommandKind.QUERY && !params.conversation_id;
+  const opened = await findOrCreateTab(params.conversation_id || null, { forNew });
+  let tab = opened.tab;
+  const created = opened.created;
+  const isGeminiApp = (u) => /gemini\.google\.com\/app/i.test(u || "");
+  if (!isGeminiApp(tab.url)) {
+    for (let i = 0; i < 15; i++) {
+      await sleepGauss(380, 90, 180, 700);
+      try {
+        tab = await chrome.tabs.get(tab.id);
+      } catch {
+        break;
+      }
+      if (isGeminiApp(tab.url)) break;
+    }
+  }
+  await postEvent(commandId, EventType.TAB_OPENED, {
+    tabId: tab.id,
+    created,
+    forNew: !!forNew,
+    url: tab.url,
+  });
+  await sleepGauss(
+    created ? 3500 : 1200,
+    created ? 600 : 300,
+    created ? 2500 : 700,
+    created ? 5500 : 2200
+  );
+  let ping = await waitTabReady(tab.id);
+  if (ping.account) await setState({ account: ping.account });
+
+  const wantCid = (params.conversation_id || "").toLowerCase() || null;
+  if (wantCid && ping.conversation_id !== wantCid) {
+    await chrome.tabs.update(tab.id, { url: `https://gemini.google.com/app/${wantCid}` });
+    await sleepGauss(2600, 500, 1600, 4200);
+    ping = await waitTabReady(tab.id);
+    if (ping.conversation_id && ping.conversation_id !== wantCid) {
+      throw new Error(
+        `tab on wrong conversation: have=${ping.conversation_id} want=${wantCid}`
+      );
+    }
+  }
+  await postEvent(commandId, EventType.DELTA, {
+    tab_ready: true,
+    forNew: !!forNew,
+    conversation_id: ping.conversation_id || null,
+  });
+  return { tab, ping, forNew };
+};
+
+const runRemoteCommand = async (cmd) => {
+  const kind = cmd.kind;
+  const params = cmd.params || {};
+  const commandId = cmd.id;
+  SW.beginRemote();
+  try {
+  if (!(await assertRemoteAllowed(commandId))) return;
+  await paceBeforeRemote(kind);
 
   let tab = null;
-  cdpAbort = false;
+  SW.setCdpAbort(false);
   try {
     await postEvent(commandId, EventType.RUNNING, { kind });
-    const forNew = kind === CommandKind.QUERY && !params.conversation_id;
-    const opened = await findOrCreateTab(params.conversation_id || null, { forNew });
-    tab = opened.tab;
-    const created = opened.created;
-    // chrome.tabs.create can return before url is set; wait for a real gemini /app URL.
-    const isGeminiApp = (u) => /gemini\.google\.com\/app/i.test(u || "");
-    if (!isGeminiApp(tab.url)) {
-      for (let i = 0; i < 15; i++) {
-        await sleepGauss(380, 90, 180, 700);
-        try {
-          tab = await chrome.tabs.get(tab.id);
-        } catch {
-          break;
-        }
-        if (isGeminiApp(tab.url)) break;
-      }
-    }
-    await postEvent(commandId, EventType.TAB_OPENED, { tabId: tab.id, created, url: tab.url });
-    // Settle after navigation before first gesture.
-    await sleepGauss(
-      created ? 3500 : 1200,
-      created ? 600 : 300,
-      created ? 2500 : 700,
-      created ? 5500 : 2200
-    );
-    let ping = await waitTabReady(tab.id);
-    if (ping.account) await setState({ account: ping.account });
-
-    // Ensure we landed on the requested conversation (SPA can leave us on /app).
-    const wantCid = (params.conversation_id || "").toLowerCase() || null;
-    if (wantCid && ping.conversation_id !== wantCid) {
-      await chrome.tabs.update(tab.id, { url: `https://gemini.google.com/app/${wantCid}` });
-      await sleepGauss(2600, 500, 1600, 4200);
-      ping = await waitTabReady(tab.id);
-      if (ping.conversation_id && ping.conversation_id !== wantCid) {
-        throw new Error(
-          `tab on wrong conversation: have=${ping.conversation_id} want=${wantCid}`
-        );
-      }
-    }
+    ({ tab } = await openGeminiTabForCommand(params, kind, commandId));
 
     // Idle + hard share broker timeout_s (DELTA must not overrun the CLI budget).
     const timeoutMs = Math.max(15, Math.min(600, Number(cmd.timeout_s) || Number(params.timeout_s) || 180)) * 1000;
@@ -886,7 +929,7 @@ const runRemoteCommand = async (cmd) => {
 
     const signalContentCancel = async (reason) => {
       aborted = true;
-      cdpAbort = true;
+      SW.setCdpAbort(true);
       try {
         await debuggerDetach(tab.id);
       } catch {
@@ -1110,22 +1153,21 @@ const runRemoteCommand = async (cmd) => {
     }
   }
   } finally {
-    remoteInFlight = Math.max(0, remoteInFlight - 1);
-    maybeReloadForContentHash();
+    SW.endRemote();
   }
 };
 
 const pollLoop = async () => {
-  if (pollRunning) return;
-  pollRunning = true;
+  if (SW.pollRunning) return;
+  SW.pollRunning = true;
   log("poll loop started");
   try {
     while (true) {
-      if (commandBusy) {
+      if (SW.commandBusy) {
         // Poll is skipped while busy; refresh last_seen so broker TTL (60s) does not
         // drop browsers[] during long query/pacing (heartbeat alarm alone can miss).
-        if (Date.now() - lastBusyHeartbeatAt > gaussian(15_000, 3_000, 10_000, 22_000)) {
-          lastBusyHeartbeatAt = Date.now();
+        if (Date.now() - SW.lastBusyHeartbeatAt > gaussian(15_000, 3_000, 10_000, 22_000)) {
+          SW.lastBusyHeartbeatAt = Date.now();
           try {
             await registerOrHeartbeat();
           } catch {
@@ -1135,7 +1177,7 @@ const pollLoop = async () => {
         await sleepGauss(520, 120, 280, 900);
         continue;
       }
-      if (Date.now() < backoffUntil) {
+      if (Date.now() < SW.backoffUntil) {
         await sleepGauss(2100, 450, 1200, 3500);
         continue;
       }
@@ -1156,7 +1198,7 @@ const pollLoop = async () => {
       }
       if (res.status === 429) {
         const wait = gaussian(60_000, 12_000, 35_000, 95_000);
-        backoffUntil = Date.now() + wait;
+        SW.backoffUntil = Date.now() + wait;
         logWarn("poll rate-limited (429); backing off", Math.round(wait / 1000), "s");
         continue;
       }
@@ -1168,18 +1210,18 @@ const pollLoop = async () => {
       const cmd = await res.json();
       if (!cmd || !cmd.id) continue;
       log("claimed command", cmd.kind, cmd.id?.slice?.(0, 8) || cmd.id);
-      commandBusy = true;
-      lastBusyHeartbeatAt = Date.now();
+      SW.commandBusy = true;
+      SW.lastBusyHeartbeatAt = Date.now();
       try {
         await runRemoteCommand(cmd);
       } finally {
-        commandBusy = false;
+        SW.commandBusy = false;
         // serialize: jitter after each command
         await sleepGauss(600, 150, 300, 1200);
       }
     }
   } finally {
-    pollRunning = false;
+    SW.pollRunning = false;
     logWarn("poll loop stopped; restarting");
     // restart later
     setTimeout(() => pollLoop(), gaussian(2200, 500, 1200, 4000));
@@ -1242,7 +1284,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           captchaBlockedUntil: 0,
           captchaStrikes: 0,
         });
-        backoffUntil = 0;
+        SW.backoffUntil = 0;
         sendResponse({ ok: true });
         return;
 
@@ -1274,7 +1316,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         await setState(patch);
         // Turning trusted input off: drop debugger sessions unless a command is mid-flight
         // (TYPE/PASTE still need CDP; detaching mid-command breaks compose).
-        if (patch.trustedInput === false && !commandBusy) {
+        if (patch.trustedInput === false && !SW.commandBusy) {
           for (const tabId of [...debuggerSessions]) {
             await debuggerDetach(tabId);
           }

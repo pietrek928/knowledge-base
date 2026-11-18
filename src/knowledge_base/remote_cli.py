@@ -286,6 +286,12 @@ def query_cmd(
 @click.option("--account", default=None)
 @click.option("--timeout", "timeout_s", default=60, type=int, show_default=True)
 @click.option(
+    "--final-json",
+    is_flag=True,
+    default=False,
+    help="Accepted for script parity with query; list-models already prints one JSON object.",
+)
+@click.option(
     "--debug",
     is_flag=True,
     default=False,
@@ -298,9 +304,11 @@ def list_models_cmd(
     browser_id: str | None,
     account: str | None,
     timeout_s: int,
+    final_json: bool,
     debug: bool,
 ) -> None:
     """List unlocked Gemini models/efforts from the live picker."""
+    _ = final_json  # flag accepted; output is already one JSON object
     params: dict[str, Any] = {"timeout_s": timeout_s}
     if conversation_id:
         params["conversation_id"] = conversation_id

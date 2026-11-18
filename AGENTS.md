@@ -43,6 +43,10 @@ uv run kb-cli query "Reply with exactly one word: pong. nonce:$RANDOM" \
 
 **Scroll deltas**: expect `tail_gap` / `scroll_top` / `hard_left_ms` on generation deltas. `scroll_fires` may stay `0` when Gemini auto-follows the tip above the composer while length grows.
 
+**Fresh vs continue**: `query` without `--conversation-id` forces a New chat (do not reuse densify/mine tabs). Pass `--conversation-id` to continue a thread. `list-models` accepts `--final-json` for script parity (output is already one JSON object).
+
+**Never** `kb-cli … | python <<'PY'` — the heredoc steals stdin from the pipe. Write CLI JSON to a file, then `python` that path (or use `python -c` with an explicit file read).
+
 If `kb-cli browsers` cannot connect, start **one** `kb serve` on `:9099`. If the port is already open, do not start another — duplicate listeners flap `browsers[]`.
 
 ## Waits / pacing (no fixed sleeps)
