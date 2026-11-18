@@ -8,6 +8,7 @@ import {
   TrustedAction,
   EventType,
   CommandStatus,
+  ExtractSource,
   MsgType,
   gaussMs,
 } from "../shared/constants.js";
@@ -652,14 +653,57 @@ const wantContentHash = () => {
 };
 
 let _cachedContentHash = "";
+let _reloadForHashScheduled = false;
+let _pendingReloadForHash = false;
+let remoteInFlight = 0;
+
+const maybeReloadForContentHash = () => {
+  if (!_pendingReloadForHash || _reloadForHashScheduled || remoteInFlight > 0) return;
+  _pendingReloadForHash = false;
+  _reloadForHashScheduled = true;
+  log("build-meta contentHash changed (deferred); chrome.runtime.reload()");
+  try {
+    chrome.runtime.reload();
+  } catch (err) {
+    _reloadForHashScheduled = false;
+    logWarn("runtime.reload failed", String(err?.message ?? err));
+  }
+};
+
 const refreshContentHashCache = async () => {
   try {
     const url = chrome.runtime.getURL("build-meta.json");
     const res = await fetch(url);
     if (!res.ok) return;
     const meta = await res.json();
-    _cachedContentHash = meta.contentHash || "";
+    const next = meta.contentHash || "";
+    const prev = _cachedContentHash;
+    _cachedContentHash = next;
     globalThis.__KB_BUILD_META__ = meta;
+    // Unpacked rebuilds update dist/ on disk while the SW keeps stale content.js.
+    // Reload the extension once so tabs pick up the new contentHash.
+    if (prev && next && prev !== next && !_reloadForHashScheduled) {
+      if (remoteInFlight > 0) {
+        _pendingReloadForHash = true;
+        log("build-meta contentHash changed; defer reload until remote idle", {
+          prev,
+          next,
+          remoteInFlight,
+        });
+      } else {
+        _reloadForHashScheduled = true;
+        log("build-meta contentHash changed; chrome.runtime.reload()", {
+          prev,
+          next,
+        });
+        try {
+          chrome.runtime.reload();
+        } catch (err) {
+          _reloadForHashScheduled = false;
+          logWarn("runtime.reload failed", String(err?.message ?? err));
+        }
+      }
+    }
   } catch {
     /* ignore */
   }
@@ -749,10 +793,12 @@ const pickDebugFields = (src) => {
 };
 
 const runRemoteCommand = async (cmd) => {
+  remoteInFlight += 1;
   const kind = cmd.kind;
   const params = cmd.params || {};
   const commandId = cmd.id;
 
+  try {
   const state0 = await getState();
   if (state0.captchaNeedsUser || Date.now() < backoffUntil || Date.now() < state0.captchaBlockedUntil) {
     await postEvent(commandId, EventType.ERROR, {
@@ -822,9 +868,9 @@ const runRemoteCommand = async (cmd) => {
       }
     }
 
-    // Idle timeout extends only on real progress; hardDeadline is the safety net.
+    // Idle + hard share broker timeout_s (DELTA must not overrun the CLI budget).
     const timeoutMs = Math.max(15, Math.min(600, Number(cmd.timeout_s) || Number(params.timeout_s) || 180)) * 1000;
-    const hardMs = Math.min(600_000, Math.max(timeoutMs * 3, timeoutMs + 120_000));
+    const hardMs = timeoutMs;
     const startedAt = Date.now();
     let idleDeadline = startedAt + timeoutMs;
     const hardDeadline = startedAt + hardMs;
@@ -1019,18 +1065,20 @@ const runRemoteCommand = async (cmd) => {
         log("next query after reading dwell", Math.round(gap / 1000), "s");
       }
     }
+    const extractRpc = result.source === ExtractSource.RPC || result.source === "rpc";
     if (
       kind === CommandKind.SEARCH &&
       params.conversation_id &&
       Array.isArray(result.turns) &&
       result.turns.length &&
-      result.complete !== false
+      result.complete === true &&
+      extractRpc
     ) {
       await ingestTurns({
         conversationId: params.conversation_id,
         title: result.title || params.conversation_id,
         turns: result.turns,
-        complete: result.complete !== false,
+        complete: true,
       });
     }
 
@@ -1060,6 +1108,10 @@ const runRemoteCommand = async (cmd) => {
         /* ignore */
       }
     }
+  }
+  } finally {
+    remoteInFlight = Math.max(0, remoteInFlight - 1);
+    maybeReloadForContentHash();
   }
 };
 

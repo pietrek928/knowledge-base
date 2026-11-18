@@ -20,7 +20,7 @@ async def test_broker_page_html_enqueue_defaults():
     cmd = await broker.enqueue("page-html", {"selector": "body"})
     assert cmd["kind"] == "page-html"
     assert cmd["timeout_s"] == 60
-    assert cmd["params"].get("max_chars") == 200_000
+    assert cmd["params"].get("max_chars") is None
     assert cmd["params"].get("selector") == "body"
     assert cmd["status"] == "pending"
 

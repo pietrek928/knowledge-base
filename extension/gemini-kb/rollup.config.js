@@ -158,12 +158,20 @@ function finalizeDist() {
   renderIcons();
 
   const contentJs = readFileSync(contentPath);
-  const contentHash = createHash("sha256").update(contentJs).digest("hex").slice(0, 16);
+  const backgroundJs = readFileSync(join(DIST, "background.js"));
+  const popupJs = readFileSync(join(DIST, "popup.js"));
+  // Hash content+background+popup so unpacked rebuilds invalidate stale SWs/tabs.
+  const contentHash = createHash("sha256")
+    .update(contentJs)
+    .update(backgroundJs)
+    .update(popupJs)
+    .digest("hex")
+    .slice(0, 16);
   writeBuildMeta(contentHash);
   patchDistManifest();
   applyDevReload();
 
-  const bg = readFileSync(join(DIST, "background.js"), "utf8");
+  const bg = backgroundJs.toString("utf8");
   if (/importScripts\s*\(\s*["']constants\.js["']/.test(bg)) {
     throw new Error('dist/background.js still importScripts("constants.js")');
   }

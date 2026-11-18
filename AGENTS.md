@@ -12,15 +12,25 @@ Do **not** burn the main chat context on long multi-file development (enums, Gau
 
 Short answers, one-line fixes, and user Q&A stay in the main agent.
 
+## Gemini extension: rebuild → reload → smoke
+
+`npm run build` in `extension/gemini-kb` only updates `dist/`. Chromium keeps the previous SW/content scripts until the **unpacked extension is reloaded**.
+
+1. After any extension code change you will live-test: `npm run build`, then **ask the user to reload** unpacked `extension/gemini-kb/dist` (chrome://extensions → Reload). Do not assume disk hash auto-reload or `chrome.runtime.reload()` already applied.
+2. Confirm the new build is live before diagnosing failures: generation deltas should match current code (e.g. `hard_left_ms` ≈ `--timeout`×1000, not 3×; new fields like `tail_gap` / `scroll_fires` present when expected). Stale signs: old `hard_left`, missing new delta keys, empty `browsers[]` until reload.
+3. Popup KB URL must stay `http://127.0.0.1:9099`. Empty `browsers[]` with a healthy serve usually means reload the extension (or fix the popup URL) — not a second `kb serve`.
+
 ## Gemini extension smoke tests
 
 When smoke-testing `kb-cli` / the Gemini extension (`query`, chip match, keepalive, cancel, etc.):
 
-1. Prefer the **cheapest unlocked** model from a fresh `uv run kb-cli list-models`.
-2. Today that is usually **`Quick answers 3.5 Flash-Lite`** (not Pro, Argon, or locked Carbon).
-3. Keep prompts tiny (one-word reply) with a **new nonce** each run. Re-run `list-models` if the label set changes; never hard-code a locked SKU.
-4. Only use a heavier model when the test specifically needs that SKU (e.g. Argon chip-suffix regression).
-5. Do not enqueue while `browsers[].busy`; abort in-flight work with SIGINT or SIGTERM. SIGKILL leaves `busy` set.
+1. **Reload first** if you rebuilt since the last reload (see above).
+2. Prefer the **cheapest unlocked** model from a fresh `uv run kb-cli list-models`.
+3. Today that is usually **`Quick answers 3.5 Flash-Lite`** (not Pro, Argon, or locked Carbon).
+4. Keep prompts tiny (one-word reply) with a **new nonce** each run. Re-run `list-models` if the label set changes; never hard-code a locked SKU.
+5. Only use a heavier model when the test specifically needs that SKU (e.g. Argon chip-suffix regression).
+6. Do not enqueue while `browsers[].busy`; abort in-flight work with SIGINT or SIGTERM. SIGKILL leaves `busy` set.
+7. **After a fix + reload: re-smoke only what failed** (and a cheap live-build check if needed). Do not re-run the full suite.
 
 ```bash
 uv run kb-cli browsers   # one server; every browsers[].busy must be false
@@ -28,6 +38,10 @@ uv run kb-cli list-models --timeout 180
 uv run kb-cli query "Reply with exactly one word: pong. nonce:$RANDOM" \
   --model 'Quick answers 3.5 Flash-Lite' --timeout 180 --final-json
 ```
+
+**Model skip** (chip already matches): run the same `--model` twice. Assert `model_selected.payload.skipped === true` on the second (or first, if the chip was already that model). Do **not** use composing deltas as a skip proxy — keepalive still emits `composing: true` after select/skip. Skip gate is `pickerIsOpen()`, not `menuRoots().length` (closed `aria-controls` panels stay in the DOM).
+
+**Scroll deltas**: expect `tail_gap` / `scroll_top` / `hard_left_ms` on generation deltas. `scroll_fires` may stay `0` when Gemini auto-follows the tip above the composer while length grows.
 
 If `kb-cli browsers` cannot connect, start **one** `kb serve` on `:9099`. If the port is already open, do not start another — duplicate listeners flap `browsers[]`.
 

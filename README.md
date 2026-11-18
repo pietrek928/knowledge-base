@@ -119,7 +119,7 @@ uv run kb-cli list-models          # unlocked labels + efforts only; also return
 uv run kb-cli list-models --conversation-id <id>
 uv run kb-cli conversations        # cached gemini/* threads (logical path + store_path)
 uv run kb-cli page-html -o /tmp/gemini.html
-uv run kb-cli page-html --selector 'button[aria-label*="model" i]' --max-chars 50000
+uv run kb-cli page-html --selector 'button[aria-label*="model" i]'
 # Exact unlocked label from list-models (do not invent :high unless listed):
 uv run kb-cli query "explain batch_size" --model 'Code & analysis 4 Argon'
 uv run kb-cli query "follow-up" --conversation-id <id> --timeout 420 --final-json
@@ -131,7 +131,7 @@ uv run kb-cli search --conversation-id <id> -q batch_size --source cache
 - **`list-models`**: unlocked picker rows only. Per-model `efforts` start from an embedded token or `["medium"]`, then may gain `high` only after an **Argon-only** picker probe proves an unlocked High row (probe restores the prior model afterward). Top-level `thinking_levels` / `debug.effort_levels_seen` are scrape hints — **not** permission to pass `:high`. Locked/paywall rows appear under `locked` — do not query them (e.g. Carbon unlock).
 - **`conversations`**: lists cached `gemini/` docs. Logical `path` is `gemini/{id}.md`; on disk under `data_dir` as `content/{path}.json` (e.g. `~/.kb/content/gemini/{id}.md.json`) — not a file in the repo cwd.
 - **`search`**: without `--conversation-id` returns conversation hits; with it, message hits. `--source cache` reads the KB store; `gemini-live` fans out to connected browsers. Hits include `store_path` hints.
-- **`page-html`**: dumps live page HTML for debugging (`--selector`, `--max-chars`, `-o` to write the body to a file).
+- **`page-html`**: dumps live chat HTML for debugging (default = `user-query`/`model-response` turns; `--selector` for chrome/picker; optional `--max-chars` ceiling; `-o` to write the body to a file).
 - Multiple browsers: `kb-cli browsers` lists them; pass `--browser-id` / `--account` to route. Live search merges all accounts.
 - Extension input: **TYPE/PASTE always use CDP debugger** (even when popup **Trusted input** is off). That checkbox only gates **click/move/wheel** (debugger banner, can trip anti-bot). Saving Trusted input off does not detach mid-command. Also: reading-time pacing, DOM-first extract, exponential captcha backoff (open the popup after `/sorry` to clear the gate).
 

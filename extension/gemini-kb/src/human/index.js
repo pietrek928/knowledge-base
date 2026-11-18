@@ -179,6 +179,47 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     }
   };
 
+  /** Prefer a scrollable ancestor of fromEl over document.scrollingElement. */
+  const resolveScrollRoot = (fromEl) => {
+    // Start at parent so a nested <pre>/<code> overflow box is never the chat root.
+    let node =
+      fromEl && fromEl.nodeType === 1 ? fromEl.parentElement : null;
+    const minH = window.innerHeight * 0.4;
+    while (node && node !== document.documentElement) {
+      if (node.scrollHeight > node.clientHeight + 8 && node.clientHeight >= minH) {
+        const oy = getComputedStyle(node).overflowY;
+        if (oy === "auto" || oy === "scroll" || oy === "overlay") return node;
+      }
+      node = node.parentElement;
+    }
+    return document.scrollingElement || document.body;
+  };
+
+  /** Wheel over root’s content area; last-resort scrollTop if wheel is a no-op. */
+  const humanScrollInRoot = async (root, deltaY) => {
+    if (!root) {
+      await humanScroll(deltaY);
+      return;
+    }
+    const rect = root.getBoundingClientRect();
+    const cur = cursor();
+    const x = Math.max(
+      8,
+      Math.min(window.innerWidth - 8, rect.left + rect.width * 0.5)
+    );
+    const y = Math.max(
+      8,
+      Math.min(window.innerHeight - 8, rect.top + rect.height * 0.5)
+    );
+    cur.x = x;
+    cur.y = y;
+    const before = root.scrollTop;
+    await humanScroll(deltaY);
+    if (Math.abs(root.scrollTop - before) < 2 && Math.abs(deltaY) > 40) {
+      root.scrollTop = before + deltaY;
+    }
+  };
+
   const scrollIntoViewHuman = async (el) => {
     for (let iter = 0; iter < 3; iter++) {
       const rect = el.getBoundingClientRect();
@@ -629,6 +670,8 @@ export {
   gaussianDelay,
   betweenActions,
   humanScroll,
+  resolveScrollRoot,
+  humanScrollInRoot,
   scrollIntoViewHuman,
   humanClick,
   humanType,

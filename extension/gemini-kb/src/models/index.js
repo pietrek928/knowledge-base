@@ -867,6 +867,27 @@ const capturePageDebugHtml = () =>
     const wantEffort = (effort || DEFAULT_EFFORT).toLowerCase();
     try {
       throwIfAborted();
+      // Skip picker when chip already matches model + effort.
+      // Trailing effort token is authoritative. Chip often omits the effort word for
+      // medium — soft-skip only in that case (never soft-skip high/low/fast).
+      // Use pickerIsOpen() — not menuRoots().length — closed aria-controls panels still
+      // exist in the DOM and would permanently block skip.
+      const chipNow = readActiveModelLabel();
+      if (chipNow && chipMatches(chipNow, model) && !pickerIsOpen()) {
+        const trailing = String(chipNow).match(/\b(low|medium|high|fast)\s*$/i);
+        const chipEffort = trailing
+          ? trailing[1].toLowerCase()
+          : effortFromLabel(chipNow);
+        const mediumOmitted = wantEffort === "medium" && !chipEffort;
+        if (chipEffort === wantEffort || mediumOmitted) {
+          return {
+            model: want,
+            effort: wantEffort,
+            label: chipNow,
+            skipped: true,
+          };
+        }
+      }
       await openPicker();
       let allItems = allMenuItemsMerged();
       let items = allItems.filter((i) => !i.locked && !isJunkChromeLabel(i.label));

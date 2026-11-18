@@ -421,8 +421,8 @@ class ExtBroker:
                 return self._cmd_public(cmd)
 
             case CommandKind.LIST_MODELS | CommandKind.PAGE_HTML:
-                if kind == CommandKind.PAGE_HTML and params.get("max_chars") is None:
-                    params["max_chars"] = 200_000
+                # page-html: do not inject max_chars — content targets chat turns;
+                # optional ceiling only when the client sends it.
                 target = self._pick_browser(
                     browser_id=browser_id,
                     account=account,

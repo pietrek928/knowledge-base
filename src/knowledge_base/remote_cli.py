@@ -180,10 +180,27 @@ def main(ctx: click.Context, url: str) -> None:
 @click.pass_context
 def browsers_cmd(ctx: click.Context) -> None:
     """List connected extension browsers."""
-    with _client(ctx.obj["url"]) as client:
-        r = client.get("/ext/browsers")
-        r.raise_for_status()
-        click.echo(json.dumps(r.json(), indent=2, ensure_ascii=False))
+    try:
+        with _client(ctx.obj["url"]) as client:
+            r = client.get("/ext/browsers")
+            r.raise_for_status()
+            body = r.json()
+    except Exception as exc:
+        click.echo(
+            "kb-cli: cannot reach kb serve "
+            f"({ctx.obj['url']}). Ensure a single `kb serve` on :9099. ({exc})",
+            err=True,
+        )
+        raise SystemExit(1) from exc
+    browsers = body.get("browsers") if isinstance(body, dict) else None
+    if isinstance(browsers, list) and not browsers:
+        click.echo(
+            "kb-cli: server is up but no extension browsers are registered. "
+            "Set the popup KB URL to http://127.0.0.1:9099 and reload unpacked "
+            "extension/gemini-kb/dist.",
+            err=True,
+        )
+    click.echo(json.dumps(body, indent=2, ensure_ascii=False))
 
 
 @main.command("query")
@@ -323,8 +340,17 @@ def list_models_cmd(
 
 @main.command("page-html")
 @click.option("--conversation-id", default=None)
-@click.option("--selector", default=None, help="CSS selector; default = full documentElement.")
-@click.option("--max-chars", default=200_000, show_default=True, type=int)
+@click.option(
+    "--selector",
+    default=None,
+    help="CSS selector override; default = user-query/model-response turns.",
+)
+@click.option(
+    "--max-chars",
+    default=None,
+    type=int,
+    help="Optional hard ceiling after targeting (omit for full turn dump).",
+)
 @click.option("-o", "--out", "out_path", default=None, type=click.Path(dir_okay=False), help="Write HTML to file.")
 @click.option("--browser-id", default=None)
 @click.option("--account", default=None)
@@ -334,14 +360,16 @@ def page_html_cmd(
     ctx: click.Context,
     conversation_id: str | None,
     selector: str | None,
-    max_chars: int,
+    max_chars: int | None,
     out_path: str | None,
     browser_id: str | None,
     account: str | None,
     timeout_s: int,
 ) -> None:
-    """Dump live Gemini page HTML for debugging (selector-scoped optional)."""
-    params: dict[str, Any] = {"timeout_s": timeout_s, "max_chars": max_chars}
+    """Dump live Gemini chat HTML for debugging (turns by default)."""
+    params: dict[str, Any] = {"timeout_s": timeout_s}
+    if max_chars is not None:
+        params["max_chars"] = max_chars
     if conversation_id:
         params["conversation_id"] = conversation_id
     if selector:

@@ -299,6 +299,15 @@ const textFromTurnEl = (el, role) => {
       break;
     }
   }
+  // Collapsed user bubbles line-clamp innerText; query-text-line nodes still hold the full prompt.
+  if (role === "user") {
+    const lines = [...el.querySelectorAll(".query-text-line")]
+      .map((n) => (n.textContent || "").trim())
+      .filter(Boolean);
+    if (lines.length) {
+      return cleanDomTurnText(role, lines.join("\n"));
+    }
+  }
   const structured = enrichStructuredContent(root);
   const plain = cleanDomTurnText(role, (root.innerText || "").trim());
 
@@ -708,26 +717,82 @@ const latestModelResponseEl = () => {
   return null;
 };
 
+const latestResponseTailEl = () => {
+  const el = latestModelResponseEl();
+  if (!el) return null;
+  const blocks = el.querySelectorAll(
+    `${RESPONSE_INNER_SEL}, p, li, pre, code, [class*="markdown" i]`
+  );
+  if (blocks.length) return blocks[blocks.length - 1];
+  return el;
+};
+
+/** Viewport Y above sticky composer; below this the reply tail is considered off-screen. */
+const composerSafeBottom = () => {
+  const vh = window.innerHeight;
+  const composer = findComposer();
+  if (composer) {
+    let box = composer.parentElement;
+    while (box && box !== document.body) {
+      const r = box.getBoundingClientRect();
+      const midY = r.top + r.height / 2;
+      const inBottomBand = midY >= vh * 0.55;
+      const heightOk = r.height >= 48 && r.height <= vh * 0.45;
+      if (inBottomBand && heightOk) return r.top - 24;
+      box = box.parentElement;
+    }
+  }
+  const tail = latestResponseTailEl();
+  const root = H.resolveScrollRoot(tail || document.body);
+  const rootBottom = root?.getBoundingClientRect?.()?.bottom;
+  if (Number.isFinite(rootBottom) && rootBottom > 0) return rootBottom - 24;
+  return vh * 0.85;
+};
+
+/** @returns {{ applied: boolean, topDelta: number }} */
+const scrollReplyTailDuringStream = async () => {
+  const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, n));
+  let applied = false;
+  let topDelta = 0;
+  for (let i = 0; i < 6; i++) {
+    const tail = latestResponseTailEl();
+    if (!tail) return { applied, topDelta };
+    const safe = composerSafeBottom();
+    const rect = tail.getBoundingClientRect();
+    const delta = rect.bottom - safe;
+    if (delta <= 40) return { applied, topDelta };
+    const root = H.resolveScrollRoot(tail);
+    const room = Math.max(0, root.scrollHeight - root.clientHeight - root.scrollTop);
+    if (room < 8) return { applied, topDelta };
+    const amount = Math.round(clamp(Math.min(delta, room), 1, 900));
+    const before = root.scrollTop;
+    await H.humanScrollInRoot(root, amount);
+    const moved = root.scrollTop - before;
+    if (Math.abs(moved) < 2) return { applied, topDelta };
+    applied = true;
+    topDelta += moved;
+    await gSleep(140, 45, 70, 240);
+  }
+  return { applied, topDelta };
+};
+
 const readLastReplyHuman = async ({ reason } = {}) => {
   try {
     const el = latestModelResponseEl();
     if (!el) return;
     const vh = window.innerHeight;
     const rect = el.getBoundingClientRect();
+    const safe = composerSafeBottom();
 
     if (reason === "mid_stream") {
-      if (rect.bottom <= vh * 0.85) return;
-      const delta = Math.round(gaussMs(260, 70, 140, 420));
-      await H.humanScroll(delta);
-      await gSleep(140, 45, 70, 240);
-      return;
+      return await scrollReplyTailDuringStream();
     }
 
     if (reason === "post_extract") {
       await H.betweenActions();
-      if (rect.bottom > vh * 0.85) {
+      if (rect.bottom > safe) {
         const delta = Math.round(gaussMs(260, 70, 140, 420));
-        await H.humanScroll(delta);
+        await H.humanScrollInRoot(H.resolveScrollRoot(el), delta);
       }
       return;
     }
@@ -736,9 +801,9 @@ const readLastReplyHuman = async ({ reason } = {}) => {
     await H.betweenActions();
     await H.scrollIntoViewHuman(el);
     const after = el.getBoundingClientRect();
-    if (after.height > vh * 0.7 && after.bottom > vh * 0.9) {
+    if (after.height > vh * 0.7 && after.bottom > safe) {
       const delta = Math.round(gaussMs(340, 90, 180, 520));
-      await H.humanScroll(delta);
+      await H.humanScrollInRoot(H.resolveScrollRoot(el), delta);
     }
     await gSleep(160, 45, 80, 300);
   } catch {
@@ -781,20 +846,32 @@ const scrapeDomTurns = () => {
 
 const waitForGenerationEnd = async (timeoutMs, onProgress) => {
   const start = Date.now();
-  // Idle budget: no DOM/generation progress for this long → stop waiting.
-  // Hard cap: absolute ceiling even while streaming (keeps runaway chats bounded).
-  const idleLimitMs = Math.max(15_000, timeoutMs);
-  const hardLimitMs = Math.min(600_000, Math.max(timeoutMs * 3, timeoutMs + 120_000));
+  // Idle + hard caps share the broker timeout (DELTA does not extend broker).
+  const idleLimitMs = timeoutMs;
+  const hardLimitMs = timeoutMs;
+  // Flat response_len while Stop/busy stays lit (false generating) → bail well before wall.
+  const quietLimitMs = Math.min(25_000, Math.max(12_000, Math.floor(timeoutMs * 0.2)));
   let sawGen = false;
+  let peakLen = 0;
   let stable = 0;
   let lastLen = -1;
   let lastScrollAt = 0;
   let scrollCooldownMs = 0;
+  let lenAtLastScroll = -1;
+  let scrollFires = 0;
+  let lastScrollTop = 0;
   let lastProgressAt = Date.now();
+  let lastLenChangeAt = Date.now();
   const minWaitMs = 2500;
   const markProgress = () => {
     lastProgressAt = Date.now();
   };
+  const finish = (extra = {}) => ({
+    sawGen,
+    peakLen,
+    elapsed_ms: Date.now() - start,
+    ...extra,
+  });
 
   while (true) {
     throwIfRemoteAborted();
@@ -808,27 +885,58 @@ const waitForGenerationEnd = async (timeoutMs, onProgress) => {
     }
 
     const { gen, len: bodyLen, busy, active } = generationProgressSignals();
+    if (bodyLen > peakLen) peakLen = bodyLen;
     if (active) {
       sawGen = true;
       stable = 0;
-      markProgress();
     }
-    // Any length change counts as progress (thinking collapse can shrink then grow again).
+    // Length change is the only progress signal (not a stuck Stop/busy bit).
     if (lastLen >= 0 && Math.abs(bodyLen - lastLen) > 15) {
       markProgress();
+      lastLenChangeAt = now;
       stable = 0;
+    } else if (lastLen < 0 && bodyLen > 0) {
+      markProgress();
+      lastLenChangeAt = now;
+    }
+    // Saw generation, then no length movement for quietLimit — even if still "active".
+    if (
+      sawGen &&
+      elapsed >= minWaitMs &&
+      now - lastLenChangeAt >= quietLimitMs
+    ) {
+      await gSleep(850, 180, 450, 1400);
+      return finish({ timedOut: true, quiet: true });
     }
 
-    if (lastLen >= 0 && bodyLen - lastLen > 200) {
-      const replyEl = latestModelResponseEl();
-      if (replyEl) {
-        const rect = replyEl.getBoundingClientRect();
-        if (rect.bottom > window.innerHeight * 0.85) {
-          if (now - lastScrollAt >= scrollCooldownMs) {
-            lastScrollAt = now;
-            scrollCooldownMs = gaussMs(3000, 700, 2000, 4000);
-            await readLastReplyHuman({ reason: "mid_stream" });
-          }
+    if (lenAtLastScroll >= 0 && bodyLen < lenAtLastScroll - 40) {
+      // Thinking collapse / DOM rewrite — don't wait for +100 from a stale peak.
+      lenAtLastScroll = bodyLen;
+    }
+    const tailEl = latestResponseTailEl();
+    const tailGap = tailEl
+      ? tailEl.getBoundingClientRect().bottom - composerSafeBottom()
+      : 0;
+    const tailBelow = !!tailEl && tailGap > 40;
+    const grewSinceScroll =
+      lenAtLastScroll < 0
+        ? lastLen >= 0 && bodyLen - lastLen > 60
+        : bodyLen - lenAtLastScroll >= 100;
+    const pollSpike = lastLen >= 0 && bodyLen - lastLen > 60;
+    // Growth (or spike) required — `active` only picks cooldown, does not force scroll.
+    if (tailBelow && (grewSinceScroll || pollSpike)) {
+      if (now - lastScrollAt >= scrollCooldownMs) {
+        scrollCooldownMs = active
+          ? gaussMs(900, 200, 500, 1400)
+          : gaussMs(3000, 700, 2000, 4000);
+        const scrollRes = await readLastReplyHuman({ reason: "mid_stream" });
+        lastScrollAt = Date.now();
+        lenAtLastScroll = bodyLen;
+        if (scrollRes?.applied) {
+          scrollFires += 1;
+          lastScrollTop = Math.round(
+            (H.resolveScrollRoot(tailEl || document.body)?.scrollTop || 0)
+          );
         }
       }
     }
@@ -839,7 +947,7 @@ const waitForGenerationEnd = async (timeoutMs, onProgress) => {
       else stable = 0;
       if (stable >= 4 && elapsed >= minWaitMs) {
         await gSleep(1600, 350, 900, 2800); // let batchexecute index the new turn
-        return { sawGen, elapsed_ms: Date.now() - start };
+        return finish();
       }
     }
     // Fast models sometimes never show Stop; require growth then plateau.
@@ -854,7 +962,7 @@ const waitForGenerationEnd = async (timeoutMs, onProgress) => {
         if (stable >= 8) {
           // No Stop and no growth for a while — likely a failed/empty submit.
           await gSleep(850, 180, 450, 1400);
-          return { sawGen: false, elapsed_ms: Date.now() - start };
+          return finish({ sawGen: false });
         }
       } else {
         stable = 0;
@@ -872,12 +980,16 @@ const waitForGenerationEnd = async (timeoutMs, onProgress) => {
     }
     if (typeof onProgress === "function") {
       try {
+        const root = H.resolveScrollRoot(tailEl || document.body);
         onProgress({
           generating: !!(gen || busy),
           elapsed_ms: elapsed,
           response_len: bodyLen,
           idle_ms: now - lastProgressAt,
           hard_left_ms: hardLimitMs - elapsed,
+          tail_gap: Math.round(Math.max(-9999, Math.min(9999, tailGap))),
+          scroll_fires: scrollFires,
+          scroll_top: Math.round(root?.scrollTop || lastScrollTop || 0),
         });
       } catch {
         /* ignore */
@@ -887,17 +999,81 @@ const waitForGenerationEnd = async (timeoutMs, onProgress) => {
   }
   // Soft timeout: still attempt extract rather than hard-fail after long wait.
   await gSleep(850, 180, 450, 1400);
-  return { sawGen, timedOut: true, elapsed_ms: Date.now() - start };
+  return finish({ timedOut: true });
 };
 
-const turnsLookComplete = (turns, { minTurns, needle, nearDeadline, attempt }) => {
+const normalizePromptNeedle = (s) =>
+  String(s || "")
+    .toLowerCase()
+    .replace(/^#{1,6}\s*/gm, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+const promptNeedles = (promptText) => {
+  const raw = String(promptText || "");
+  const norm = normalizePromptNeedle(raw);
+  const out = [];
+  if (norm.length >= 8) out.push(norm.slice(-Math.min(64, norm.length)));
+  const m = raw.match(/\bnonce[:=]\s*(\S+)/i);
+  if (m) out.push(normalizePromptNeedle(m[1]));
+  return [...new Set(out.filter(Boolean))];
+};
+
+/** last-user: last user turn must contain every needle. any-turn: some turn contains every needle. */
+const userTurnMatchesPrompt = (turns, promptText, { needleScope = "last-user" } = {}) => {
+  const needles = promptNeedles(promptText);
+  if (!needles.length) return true;
+  if (needleScope === "any-turn") {
+    const pool = (turns || []).filter((t) => (t.text || "").trim());
+    return pool.some((t) => {
+      const n = normalizePromptNeedle(t.text);
+      return needles.every((needle) => n.includes(needle));
+    });
+  }
+  const users = (turns || []).filter((t) => t.role === "user" && (t.text || "").trim());
+  if (!users.length) return false;
+  const last = normalizePromptNeedle(users[users.length - 1].text);
+  return needles.every((needle) => last.includes(needle));
+};
+
+const expandShowMoreIn = (el) => {
+  if (!el) return 0;
+  let n = 0;
+  const nodes = [
+    ...el.querySelectorAll(
+      "button, [role='button'], a, [data-test-id='luminous-expand-button']"
+    ),
+  ];
+  for (const btn of nodes) {
+    const aria = (btn.getAttribute("aria-label") || "").trim();
+    const text = (btn.textContent || "").trim();
+    const testId = btn.getAttribute("data-test-id") || "";
+    const isExpand =
+      testId === "luminous-expand-button" ||
+      /^show more$/i.test(aria) ||
+      /^expand$/i.test(aria) ||
+      /^show more$/i.test(text) ||
+      /^expand$/i.test(text);
+    if (!isExpand) continue;
+    try {
+      btn.click();
+      n += 1;
+    } catch {
+      /* ignore */
+    }
+  }
+  return n;
+};
+
+const turnsLookComplete = (
+  turns,
+  { minTurns, promptText, needleScope = "last-user", nearDeadline, attempt }
+) => {
   const hasUser = turns.some((t) => t.role === "user" && (t.text || "").trim());
   const hasModel = turns.some(
     (t) => (t.role === "gemini" || t.role === "model") && (t.text || "").trim()
   );
-  const promptOk =
-    !needle ||
-    turns.some((t) => t.role === "user" && (t.text || "").toLowerCase().includes(needle));
+  const promptOk = !promptText || userTurnMatchesPrompt(turns, promptText, { needleScope });
   return (
     turns.length >= minTurns &&
     hasUser &&
@@ -908,21 +1084,25 @@ const turnsLookComplete = (turns, { minTurns, needle, nearDeadline, attempt }) =
 
 const extractTurnsWithRetry = async (
   conversationId,
-  { minTurns = 1, timeoutMs = 40000, promptText = null, preferDom = false } = {}
+  {
+    minTurns = 1,
+    timeoutMs = 40000,
+    promptText = null,
+    preferDom = false,
+    needleScope = "last-user",
+  } = {}
 ) => {
   const start = Date.now();
   let last = { turns: [], complete: false };
   let attempt = 0;
-  const needle = promptText ? String(promptText).slice(0, 48).toLowerCase() : null;
+  const lookOpts = { minTurns, promptText, needleScope };
   while (Date.now() - start < timeoutMs) {
     attempt += 1;
     const nearDeadline = Date.now() - start > timeoutMs * 0.75;
     // Prefer DOM after a live generate — avoids hammering private hNvQHb.
     if (preferDom || attempt === 1) {
       const dom = scrapeDomTurns();
-      if (
-        turnsLookComplete(dom, { minTurns, needle, nearDeadline, attempt })
-      ) {
+      if (turnsLookComplete(dom, { ...lookOpts, nearDeadline, attempt })) {
         // DOM turn looks whole for this query → allow ingest (was always false → pendingFullSync).
         return { turns: dom, complete: true, source: ExtractSource.DOM };
       }
@@ -932,9 +1112,7 @@ const extractTurnsWithRetry = async (
       try {
         last = await extractFullThread(conversationId);
         last.source = ExtractSource.RPC;
-        if (
-          turnsLookComplete(last.turns || [], { minTurns, needle, nearDeadline, attempt })
-        ) {
+        if (turnsLookComplete(last.turns || [], { ...lookOpts, nearDeadline, attempt })) {
           return last;
         }
       } catch (err) {
@@ -946,8 +1124,7 @@ const extractTurnsWithRetry = async (
   const dom = scrapeDomTurns();
   if (dom.length > (last.turns || []).length) {
     const ok = turnsLookComplete(dom, {
-      minTurns,
-      needle,
+      ...lookOpts,
       nearDeadline: true,
       attempt,
     });
@@ -1004,30 +1181,77 @@ const remoteSearchMessages = async (params) => {
   if (!id) throw new Error("conversation_id required");
   // Background should already open this conversation; fail loudly if not.
   assertOnConversation(id);
-  let { turns, complete } = await extractTurnsWithRetry(id, {
-    minTurns: 1,
-    timeoutMs: 25000,
-  });
-  if (!(turns || []).length) {
-    const dom = scrapeDomTurns();
-    if (dom.length) {
-      turns = dom;
-      complete = false;
+  const qRaw = params.query || "";
+  const qNorm = qRaw ? normalizePromptNeedle(qRaw) : "";
+
+  let rpcTurns;
+  let complete;
+  let source;
+  try {
+    const rpc = await extractFullThread(id);
+    rpcTurns = rpc.turns || [];
+    complete = rpc.complete !== false;
+    source = ExtractSource.RPC;
+  } catch {
+    rpcTurns = scrapeDomTurns();
+    complete = false;
+    source = ExtractSource.DOM;
+  }
+
+  const toRows = (list) =>
+    (list || []).map((t) => ({
+      source: SearchSource.GEMINI_LIVE,
+      conversation_id: id,
+      title: pageTitle(),
+      role: t.role,
+      text: t.text,
+      account: detectAccount(),
+    }));
+  const filterHits = (list) => {
+    if (!qNorm) return list;
+    return list.filter((r) => normalizePromptNeedle(r.text).includes(qNorm));
+  };
+
+  let rows = filterHits(toRows(rpcTurns));
+
+  if (qNorm && !rows.length) {
+    for (const el of document.querySelectorAll("user-query, model-response")) {
+      expandShowMoreIn(el);
+    }
+    const anchor =
+      latestModelResponseEl() || document.querySelector("user-query") || document.body;
+    const chatRoot = H.resolveScrollRoot(anchor);
+    for (let i = 0; i < 8; i++) {
+      const domRows = filterHits(toRows(scrapeDomTurns()));
+      if (domRows.length) {
+        const offset = params.offset || 0;
+        const limit = params.limit || 20;
+        return {
+          hits: domRows.slice(offset, offset + limit),
+          complete: false,
+          turns: rpcTurns,
+          source,
+        };
+      }
+      try {
+        await H.humanScrollInRoot(
+          chatRoot,
+          -Math.round(gaussMs(320, 80, 160, 480))
+        );
+      } catch {
+        /* ignore */
+      }
+      await gSleep(400, 100, 200, 700);
     }
   }
-  const q = (params.query || "").toLowerCase();
-  let rows = turns.map((t) => ({
-    source: SearchSource.GEMINI_LIVE,
-    conversation_id: id,
-    title: pageTitle(),
-    role: t.role,
-    text: t.text,
-    account: detectAccount(),
-  }));
-  if (q) rows = rows.filter((r) => (r.text || "").toLowerCase().includes(q));
+
+  if (qNorm && !rows.length) {
+    return { hits: [], complete: false, turns: rpcTurns, source };
+  }
+
   const offset = params.offset || 0;
   const limit = params.limit || 20;
-  return { hits: rows.slice(offset, offset + limit), complete, turns };
+  return { hits: rows.slice(offset, offset + limit), complete, turns: rpcTurns, source };
 };
 
 const remoteListModels = async (params = {}, emit) => {
@@ -1051,21 +1275,61 @@ const remoteListModels = async (params = {}, emit) => {
   };
 };
 
+const stripChromeClone = (el) => {
+  const clone = el.cloneNode(true);
+  for (const bad of clone.querySelectorAll("script, style, svg, noscript")) {
+    bad.remove();
+  }
+  return clone;
+};
+
 const remotePageHtml = (params = {}) => {
-  const maxChars = Math.max(1000, Math.min(5_000_000, Number(params.max_chars) || 200_000));
+  const rawMax = params.max_chars;
+  const maxChars =
+    rawMax == null || rawMax === ""
+      ? null
+      : Math.max(1000, Math.min(20_000_000, Number(rawMax) || 0));
   const selector = (params.selector || "").trim() || null;
   let matchCount = null;
   let html;
+  let scope = "document";
+  let turnCount = 0;
+
   if (selector) {
     const nodes = [...document.querySelectorAll(selector)];
     matchCount = nodes.length;
-    html = nodes.map((n) => n.outerHTML).join("\n");
+    html = nodes.map((n) => stripChromeClone(n).outerHTML).join("\n");
+    scope = "selector";
   } else {
-    html = document.documentElement?.outerHTML || document.body?.outerHTML || "";
+    const turns = [...document.querySelectorAll("user-query, model-response")];
+    turnCount = turns.length;
+    if (turns.length) {
+      html = turns.map((n) => stripChromeClone(n).outerHTML).join("\n");
+      scope = "turns";
+    } else {
+      const roots = [
+        document.querySelector("infinite-scroller"),
+        document.querySelector("[class*='conversation-container' i]"),
+        document.querySelector("main"),
+      ].filter(Boolean);
+      const chatRoot = roots.find(
+        (r) => r.querySelector("user-query, model-response") || r.querySelector("message-content")
+      );
+      if (chatRoot) {
+        html = stripChromeClone(chatRoot).outerHTML;
+        scope = "chat-root";
+      } else {
+        html = document.documentElement?.outerHTML || document.body?.outerHTML || "";
+      }
+    }
   }
+
   const length = html.length;
-  const truncated = length > maxChars;
-  if (truncated) html = html.slice(0, maxChars);
+  let truncated = false;
+  if (maxChars != null && length > maxChars) {
+    html = html.slice(0, maxChars);
+    truncated = true;
+  }
   return {
     url: location.href,
     title: document.title || "",
@@ -1074,9 +1338,11 @@ const remotePageHtml = (params = {}) => {
     html,
     length,
     truncated,
+    scope,
+    turn_count: turnCount,
     selector: selector || undefined,
     match_count: matchCount ?? undefined,
-    max_chars: maxChars,
+    max_chars: maxChars ?? undefined,
   };
 };
 
@@ -1102,6 +1368,8 @@ const remoteQuery = async (params, emit) => {
     );
     await emit(EventType.MODEL_SELECTED, sel);
     modelActualLabel = sel.label || Models.readActiveModelLabel();
+    // Keepalive immediately — long picker paths otherwise look hung before compose.
+    await emit(EventType.DELTA, { composing: true, response_len: 0 });
   }
 
   throwIfRemoteAborted();
@@ -1110,8 +1378,15 @@ const remoteQuery = async (params, emit) => {
     if (params.debug) throw Models.failWithDebug("composer not found", "composer_not_found");
     throw new Error("composer not found");
   }
+  // Refocus after picker chrome; Escape dismisses any leftover overlay.
+  await H.focusTab();
+  try {
+    await H.humanKey(composer, "Escape");
+  } catch {
+    /* ignore */
+  }
   // Brief settle / pointer wander before first keystroke after navigation.
-  await gSleep(1800, 400, 1200, 3200);
+  await gSleep(900, 250, 450, 1600);
   throwIfRemoteAborted();
   try {
     await H.wanderPointer();
@@ -1122,6 +1397,11 @@ const remoteQuery = async (params, emit) => {
   // Keepalive while CDP compose can run long without generation deltas.
   await emit(EventType.DELTA, { composing: true, response_len: 0 });
   throwIfRemoteAborted();
+  try {
+    composer.focus?.();
+  } catch {
+    /* ignore */
+  }
   try {
     await H.humanType(composer, text);
   } catch (err) {
@@ -1204,10 +1484,24 @@ const remoteQuery = async (params, emit) => {
   }
   await emit(EventType.SUBMITTED, { conversation_id: id });
 
-  // Idle budget while Gemini makes DOM progress; hard cap is 3× inside waiter.
+  // Idle + hard wait share broker timeout_s (no 3× overrun).
   const timeoutMs = Math.max(15, Math.min(600, Number(params.timeout_s) || 180)) * 1000;
-  await waitForGenerationEnd(timeoutMs, (p) => emit(EventType.DELTA, p));
+  const gen = await waitForGenerationEnd(timeoutMs, (p) => emit(EventType.DELTA, p));
   throwIfRemoteAborted();
+
+  // Expand/scrape last user bubble BEFORE post_done scroll (virtualization).
+  const userNodes = document.querySelectorAll("user-query");
+  const lastUserEl = userNodes.length ? userNodes[userNodes.length - 1] : null;
+  const snapUserText = lastUserEl ? textFromTurnEl(lastUserEl, "user") : "";
+  if (lastUserEl) {
+    try {
+      await H.scrollIntoViewHuman(lastUserEl);
+    } catch {
+      /* soft-fail */
+    }
+    await gSleep(200, 50, 100, 360);
+  }
+
   await readLastReplyHuman({ reason: "post_done" });
 
   id = conversationIdFromUrl() || id;
@@ -1236,27 +1530,57 @@ const remoteQuery = async (params, emit) => {
   }
 
   throwIfRemoteAborted();
-  const { turns, complete, source } = await extractTurnsWithRetry(id, {
+  const extractBudget = Math.min(
+    45_000,
+    Math.max(8_000, timeoutMs - (gen?.elapsed_ms || 0) - 5_000)
+  );
+  let { turns, complete, source } = await extractTurnsWithRetry(id, {
     minTurns: 1,
-    timeoutMs: Math.max(12000, Math.min(45000, Math.floor(timeoutMs / 3))),
+    timeoutMs: extractBudget,
     promptText: text,
     preferDom: true,
+    needleScope: "last-user",
   });
   throwIfRemoteAborted();
 
-  const needle = String(text).slice(0, 48).toLowerCase();
-  const hasPrompt = turns.some(
-    (t) => t.role === "user" && String(t.text || "").toLowerCase().includes(needle)
-  );
-  const hasAssistant = turns.some(
+  let hasPrompt = userTurnMatchesPrompt(turns, text, { needleScope: "last-user" });
+  let hasAssistant = turns.some(
     (t) =>
       (t.role === "gemini" || t.role === "model") && String(t.text || "").trim()
   );
+  if (
+    !hasPrompt &&
+    snapUserText &&
+    userTurnMatchesPrompt([{ role: "user", text: snapUserText }], text, {
+      needleScope: "last-user",
+    }) &&
+    hasAssistant
+  ) {
+    const userMatches = turns.some(
+      (t) =>
+        t.role === "user" &&
+        userTurnMatchesPrompt([{ role: "user", text: t.text }], text, {
+          needleScope: "last-user",
+        })
+    );
+    if (!userMatches) {
+      turns.unshift({
+        role: "user",
+        text: snapUserText,
+        ts_sec: null,
+        ts_nanos: 0,
+      });
+    }
+    complete = true;
+    hasPrompt = true;
+  }
   // Stale/empty extracts must not look like success (generation never started, wrong thread).
   if (!turns.length || complete === false || !hasPrompt || !hasAssistant) {
+    const users = turns.filter((t) => t.role === "user" && (t.text || "").trim());
+    const userHead = String(users[users.length - 1]?.text || "").slice(0, 80);
     throw new Error(
       `stale or empty extract after query (turns=${turns.length}, complete=${complete}, ` +
-        `prompt=${hasPrompt}, assistant=${hasAssistant})`
+        `prompt=${hasPrompt}, assistant=${hasAssistant}, user_head=${JSON.stringify(userHead)})`
     );
   }
 
@@ -1301,10 +1625,54 @@ const remoteQuery = async (params, emit) => {
   };
 };
 
-if (!globalThis.__KB_CONTENT_BOOTED) {
-  globalThis.__KB_CONTENT_BOOTED = true;
+const KB_CS_SUPERSEDE = "kb-gemini-cs-supersede";
 
-  chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+// Same-world re-inject of the same build must not tear down an in-flight query.
+if (globalThis.__KB_CONTENT_HASH_ACTIVE === CONTENT_HASH && globalThis.__KB_CONTENT_LISTENER) {
+  // Already booted this build in this world — skip re-registration.
+} else {
+  // New build or new world: ask prior worlds to dispose, then register.
+  window.dispatchEvent(new Event(KB_CS_SUPERSEDE));
+  globalThis.__KB_CONTENT_HASH_ACTIVE = CONTENT_HASH;
+
+let csDisposed = false;
+const csDisposers = {
+  onMessage: null,
+  popstate: null,
+  visibility: null,
+  pollTimeoutIds: [],
+};
+
+const disposeContentBoot = () => {
+  if (csDisposed) return;
+  csDisposed = true;
+  if (globalThis.__KB_CONTENT_HASH_ACTIVE === CONTENT_HASH) {
+    globalThis.__KB_CONTENT_HASH_ACTIVE = "";
+  }
+  globalThis.__KB_CONTENT_LISTENER = null;
+  if (csDisposers.onMessage) {
+    chrome.runtime.onMessage.removeListener(csDisposers.onMessage);
+    csDisposers.onMessage = null;
+  }
+  if (csDisposers.popstate) {
+    window.removeEventListener("popstate", csDisposers.popstate);
+    csDisposers.popstate = null;
+  }
+  if (csDisposers.visibility) {
+    document.removeEventListener("visibilitychange", csDisposers.visibility);
+    csDisposers.visibility = null;
+  }
+  for (const tid of csDisposers.pollTimeoutIds) clearTimeout(tid);
+  csDisposers.pollTimeoutIds = [];
+  if (debounceTimer) {
+    clearTimeout(debounceTimer);
+    debounceTimer = null;
+  }
+};
+
+window.addEventListener(KB_CS_SUPERSEDE, disposeContentBoot, { once: true });
+
+csDisposers.onMessage = (msg, _sender, sendResponse) => {
     if (!msg || !msg.type) return false;
 
     switch (msg.type) {
@@ -1395,22 +1763,33 @@ if (!globalThis.__KB_CONTENT_BOOTED) {
       default:
         return false;
     }
-  });
+};
 
-  // Soft URL poll instead of wrapping history.pushState (less fingerprintable).
-  const pollUrlChange = () => {
-    const id = conversationIdFromUrl();
-    if (id && id !== lastScheduledCid) {
-      lastScheduledCid = id;
-      scheduleExtract();
-    }
-    setTimeout(pollUrlChange, gaussMs(5200, 1100, 2800, 9000));
-  };
-  setTimeout(pollUrlChange, gaussMs(2800, 700, 1200, 5000));
-  window.addEventListener("popstate", scheduleExtract);
-  document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible") scheduleExtract();
-  });
+chrome.runtime.onMessage.addListener(csDisposers.onMessage);
+globalThis.__KB_CONTENT_LISTENER = csDisposers.onMessage;
 
-  scheduleExtract();
-}
+// Soft URL poll instead of wrapping history.pushState (less fingerprintable).
+const pollUrlChange = () => {
+  if (csDisposed) return;
+  const id = conversationIdFromUrl();
+  if (id && id !== lastScheduledCid) {
+    lastScheduledCid = id;
+    scheduleExtract();
+  }
+  const tid = setTimeout(pollUrlChange, gaussMs(5200, 1100, 2800, 9000));
+  csDisposers.pollTimeoutIds.push(tid);
+};
+csDisposers.pollTimeoutIds.push(
+  setTimeout(pollUrlChange, gaussMs(2800, 700, 1200, 5000))
+);
+
+csDisposers.popstate = scheduleExtract;
+window.addEventListener("popstate", csDisposers.popstate);
+
+csDisposers.visibility = () => {
+  if (document.visibilityState === "visible") scheduleExtract();
+};
+document.addEventListener("visibilitychange", csDisposers.visibility);
+
+scheduleExtract();
+} // end boot for new hash / new world
